@@ -6,6 +6,13 @@
   "account_id": "REPLACE_WITH_ACCOUNT_ID",
   "token_file": "/absolute/path/to/.runtime/private/api-token",
   "state_file": "/absolute/path/to/.runtime/private/wechat_personal-state.json",
-  "allowed_groups": ["123456789@chatroom"],
-  "chat_provider_id": "REPLACE_WITH_ASTRBOT_PROVIDER_ID"
+  "allowed_groups": [
+    "123456789@chatroom"
+  ],
+  "chat_provider_id": "REPLACE_WITH_ASTRBOT_PROVIDER_ID",
+  "context_messages": false,
+  "context_skip_prefixes": [
+    "/"
+  ],
+  "resolve_member_names": true
 }

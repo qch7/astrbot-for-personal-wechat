@@ -43,5 +43,17 @@
         }
       }
     }
+  },
+  "alert_sessions": {
+    "description": "掉线提醒发送到",
+    "type": "list",
+    "default": [],
+    "hint": "AstrBot 会话 ID 列表（在目标会话发送 /sid 获取），例如 qq:FriendMessage:12345。小号退出登录或桥接不可达时发送提醒，恢复后再发一次。留空则不提醒。"
+  },
+  "alert_after_seconds": {
+    "description": "离线多久后提醒（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "短暂重连不提醒；最小 30 秒。"
   }
 }
