@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 shuizhaodemumu
+# Modified 2026 by qch7 (fork): group context messages, member nicknames,
+# per-group whitelist/profile defaults and bot-offline alerts.
 
 import asyncio
 import copy
@@ -26,6 +28,16 @@ from astrbot.api.platform import (
 from astrbot.api.star import Star, register
 from astrbot.core.utils.session_lock import session_lock_manager
 
+LOCAL_BRIDGE = "http://127.0.0.1:6174"
+MEMBER_NAME_TTL = 3600
+MEMBER_REFRESH_INTERVAL = 600
+
+
+def is_self_mention(native):
+    """Return whether a native message explicitly mentions the bot account."""
+    mentions = (native or {}).get("mentions") or {}
+    return mentions.get("state") == "known" and mentions.get("self") is True
+
 
 class NativeWeChatEvent(AstrMessageEvent):
     def __init__(self, message, platform):
@@ -38,6 +50,11 @@ class NativeWeChatEvent(AstrMessageEvent):
     async def send(self, message: MessageChain):
         text = "".join(part.text for part in message.chain if isinstance(part, Plain))
         if not text.strip():
+            return
+        if not is_self_mention(self.message_obj.raw_message):
+            # Context-only messages never get replies (e.g. proactive replies or
+            # plugins reacting to every group message); drop instead of failing.
+            logger.info("Native WeChat dropped a reply to an unmentioned message")
             return
         key = hashlib.sha256(
             f"{self.message_obj.message_id}:{self.delivery}".encode()
@@ -64,6 +81,9 @@ class NativeWeChatEvent(AstrMessageEvent):
         "state_file": "",
         "allowed_groups": [],
         "chat_provider_id": "",
+        "context_messages": False,
+        "context_skip_prefixes": ["/"],
+        "resolve_member_names": True,
     },
     adapter_display_name="本机个人微信",
     support_streaming_message=False,
@@ -76,10 +96,19 @@ class NativeWeChatAdapter(Platform):
             raise ValueError("Only explicit WeChat group IDs are supported")
         self.account_id = config["account_id"]
         self.base = config["server_url"].rstrip("/")
-        if self.base != "http://127.0.0.1:6174":
+        if self.base != LOCAL_BRIDGE:
             raise ValueError("This adapter is restricted to the local bridge")
         self.prefix = "/v1/accounts/" + quote(self.account_id, safe="")
         self.state_file = Path(config["state_file"])
+        # Unmentioned text is only forwarded as group-chat context; replies stay
+        # limited to explicit mentions (see reply()).
+        self.context_messages = bool(config.get("context_messages", False))
+        self.context_skip_prefixes = tuple(
+            p for p in config.get("context_skip_prefixes", ["/"]) if p
+        )
+        self.resolve_member_names = bool(config.get("resolve_member_names", True))
+        self.member_names = {}
+        self.member_refreshed = {}
         self.http = None
         self.own_id = ""
         self.started = datetime.now(UTC)
@@ -110,17 +139,20 @@ class NativeWeChatAdapter(Platform):
                 raise RuntimeError(f"WeChat bridge HTTP {response.status}")
             return await response.json()
 
-    def convert(self, native, origin):
-        """Admit only fresh, explicitly mentioned messages in approved groups.
+    def convert(self, native, origin, require_mention=True):
+        """Admit only fresh text messages in approved groups.
 
         Args:
             native: Canonical native message from the authenticated bridge.
             origin: Event origin supplied by the bridge.
+            require_mention: When False, unmentioned text is admitted as
+                context only (no At component, so AstrBot does not wake the
+                model), except text starting with a skipped command prefix.
 
         Returns:
             An AstrBot message, or None when the message is outside the policy.
         """
-        mentions = native.get("mentions") or {}
+        mentioned = is_self_mention(native)
         if (
             origin != "live"
             or native.get("accountId") != self.account_id
@@ -131,8 +163,11 @@ class NativeWeChatAdapter(Platform):
             or native.get("senderId") == self.own_id
             or not native.get("body")
             or native.get("recall")
-            or mentions.get("state") != "known"
-            or mentions.get("self") is not True
+        ):
+            return None
+        if not mentioned and (
+            require_mention
+            or native["body"].lstrip().startswith(self.context_skip_prefixes)
         ):
             return None
         try:
@@ -152,7 +187,11 @@ class NativeWeChatAdapter(Platform):
         message.message_id = native["id"]
         message.sender = MessageMember(native["senderId"], native["senderId"])
         message.message_str = native["body"]
-        message.message = [At(qq=self.own_id), Plain(native["body"])]
+        message.message = (
+            [At(qq=self.own_id), Plain(native["body"])]
+            if mentioned
+            else [Plain(native["body"])]
+        )
         message.timestamp = int(created.timestamp())
         message.raw_message = native
         return message
@@ -203,9 +242,19 @@ class NativeWeChatAdapter(Platform):
                             ):
                                 raise RuntimeError("WeChat message identity mismatch")
                             if native["id"] not in self.seen:
-                                message = self.convert(native, data.get("origin"))
+                                message = self.convert(
+                                    native,
+                                    data.get("origin"),
+                                    require_mention=not self.context_messages,
+                                )
                                 if message:
                                     self.seen = (self.seen + [native["id"]])[-2048:]
+                                    name = await self.member_name(
+                                        native["threadId"], native["senderId"]
+                                    )
+                                    message.sender = MessageMember(
+                                        native["senderId"], name
+                                    )
                         self.cursor = event["cursor"]
                         # Persist before dispatch to avoid repeated replies after a crash.
                         state = {
@@ -220,9 +269,14 @@ class NativeWeChatAdapter(Platform):
                         temporary.replace(self.state_file)
                         if message:
                             self.commit_event(NativeWeChatEvent(message, self))
-                            logger.info(
-                                "Native WeChat admitted one mentioned group message"
-                            )
+                            if is_self_mention(message.raw_message):
+                                logger.info(
+                                    "Native WeChat admitted one mentioned group message"
+                                )
+                            else:
+                                logger.debug(
+                                    "Native WeChat forwarded one group context message"
+                                )
                     await asyncio.sleep(1 if len(page["items"]) < 100 else 0)
                 except asyncio.CancelledError:
                     raise
@@ -245,7 +299,7 @@ class NativeWeChatAdapter(Platform):
         current = await self.request(
             "GET", "/messages/" + quote(source.message_id, safe="")
         )
-        if not self.convert(current, "live"):
+        if not self.convert(current, "live", require_mention=True):
             raise ValueError("Original message is no longer eligible for a reply")
         intent = await self.request(
             "POST",
@@ -269,6 +323,50 @@ class NativeWeChatAdapter(Platform):
                 "WeChat delivery is unconfirmed; do not automatically resend"
             )
 
+    async def member_name(self, group, username):
+        """Resolve a member's group nickname, falling back to the WeChat ID.
+
+        Names are cached for an hour. A member missing from the bridge's cache
+        triggers at most one member refresh per group every ten minutes; any
+        failure keeps the ID so message handling never blocks on names.
+        """
+        if not self.resolve_member_names:
+            return username
+        key = (group, username)
+        cached = self.member_names.get(key)
+        if cached and cached[1] > time.monotonic():
+            return cached[0]
+        path = (
+            "/groups/" + quote(group, safe="") + "/members/" + quote(username, safe="")
+        )
+        name = None
+        try:
+            lookup = await self.request("GET", path)
+            member = lookup.get("member") if lookup.get("state") == "present" else None
+            if member:
+                for field in ("roomDisplayName", "displayName", "mentionName"):
+                    value = member.get(field)
+                    if isinstance(value, str) and value.strip():
+                        name = value.strip()
+                        break
+            elif (
+                time.monotonic() - self.member_refreshed.get(group, -1e9)
+                > MEMBER_REFRESH_INTERVAL
+            ):
+                self.member_refreshed[group] = time.monotonic()
+                await self.request(
+                    "POST",
+                    "/groups/" + quote(group, safe="") + "/members/refresh",
+                    json={},
+                )
+        except (aiohttp.ClientError, TimeoutError, RuntimeError, ValueError) as exc:
+            logger.warning("Could not resolve WeChat member name: %s", str(exc))
+        # Unresolved names are retried soon, e.g. after a member refresh lands.
+        ttl = MEMBER_NAME_TTL if name else 60
+        name = name or username
+        self.member_names[key] = (name, time.monotonic() + ttl)
+        return name
+
     async def send_by_session(self, session, message_chain):
         raise ValueError("Proactive sending is disabled; reply to an admitted event")
 
@@ -278,15 +376,34 @@ class NativeWeChatAdapter(Platform):
 
 
 @register(
-    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.2.0"
+    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.3.0"
 )
 class NativeWeChatPlugin(Star):
     def __init__(self, context, config=None):
         super().__init__(context, config)
         self.config = config if config is not None else {}
+        self.watch_task = None
 
     async def initialize(self):
-        """Discover allowed groups and apply their independently selected personas."""
+        """Discover allowed groups, apply their personas and start offline alerts."""
+        await self.configure_groups()
+        platforms = [
+            p
+            for p in self.context.astrbot_config_mgr.default_conf.get("platform", [])
+            if p.get("type") == "native_wechat" and p.get("enable")
+        ]
+        if self.watch_task:
+            self.watch_task.cancel()
+        self.watch_task = None
+        if platforms and self.alert_sessions():
+            self.watch_task = asyncio.create_task(self.watch_accounts(platforms))
+
+    async def terminate(self):
+        if self.watch_task:
+            self.watch_task.cancel()
+            self.watch_task = None
+
+    async def configure_groups(self):
         manager = self.context.astrbot_config_mgr
         rules = self.config.setdefault("groups", [])
         indexed = {}
@@ -314,6 +431,9 @@ class NativeWeChatPlugin(Star):
                     model = profile["agent_runner"]["config"]["model"]
                     model["provider_id"] = platform["chat_provider_id"]
                     model["fallback_provider_ids"] = []
+                    if platform.get("context_messages"):
+                        # Let the model tell group members apart in shared context.
+                        profile["provider_settings"]["identifier"] = True
                     profile_id = await manager.create_conf(
                         profile, name=f"微信 · {group}"
                     )
@@ -329,6 +449,7 @@ class NativeWeChatPlugin(Star):
                 if runner.get("runner_type", "local") != "local":
                     logger.warning("Skipping non-local WeChat profile: %s", origin)
                     continue
+                self.apply_profile_defaults(origin, profile, platform)
                 persona_config = runner["config"].setdefault("persona", {})
                 key = (platform["id"], group)
                 rule = indexed.get(key)
@@ -389,6 +510,112 @@ class NativeWeChatPlugin(Star):
         except (TimeoutError, OSError, aiohttp.ClientError, ValueError):
             logger.warning("Could not refresh WeChat group label: %s", group)
             return None
+
+    def apply_profile_defaults(self, origin, profile, platform):
+        """Keep a group's isolated profile usable for this adapter.
+
+        Adds the group session to the profile's ID whitelist when the whitelist
+        is enabled (it is inherited from the default profile and would silently
+        stop every event), and disables proactive replies when context messages
+        are forwarded, because only explicit mentions may be answered.
+
+        Returns:
+            Whether the profile was changed and saved.
+        """
+        changed = False
+        settings = profile.setdefault("platform_settings", {})
+        if settings.get("enable_id_white_list"):
+            whitelist = settings.setdefault("id_whitelist", [])
+            if origin not in whitelist:
+                whitelist.append(origin)
+                changed = True
+                logger.info("Added %s to its profile's ID whitelist", origin)
+        if platform.get("context_messages"):
+            active = (profile.get("provider_ltm_settings") or {}).get("active_reply")
+            if isinstance(active, dict) and active.get("enable"):
+                active["enable"] = False
+                changed = True
+                logger.info("Disabled proactive replies for %s", origin)
+        if changed:
+            profile.save_config()
+        return changed
+
+    def alert_sessions(self):
+        sessions = self.config.get("alert_sessions") or []
+        return [s.strip() for s in sessions if isinstance(s, str) and s.strip()]
+
+    async def account_status(self, platform):
+        """Return (online, detail) for a platform's bridge account."""
+        if platform.get("server_url", "").rstrip("/") != LOCAL_BRIDGE:
+            return False, "桥接地址无效"
+        try:
+            token = Path(platform["token_file"]).read_text().strip()
+            async with aiohttp.ClientSession(
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=aiohttp.ClientTimeout(total=10),
+                trust_env=False,
+            ) as client:
+                url = (
+                    LOCAL_BRIDGE
+                    + "/v1/accounts/"
+                    + quote(platform["account_id"], safe="")
+                )
+                async with client.get(url, allow_redirects=False) as response:
+                    if response.status != 200:
+                        return False, f"桥接返回 HTTP {response.status}"
+                    account = await response.json()
+        except (
+            TimeoutError,
+            OSError,
+            aiohttp.ClientError,
+            ValueError,
+            KeyError,
+        ) as exc:
+            return False, f"桥接不可达（{type(exc).__name__}）"
+        if not account.get("authenticated"):
+            return False, "账号已退出登录"
+        if account.get("connection") != "online":
+            return False, f"连接状态 {account.get('connection')}"
+        return True, "在线"
+
+    async def check_accounts(self, platforms, state, now):
+        """One offline-alert round; state maps platform ID to its tracking dict."""
+        delay = max(30, int(self.config.get("alert_after_seconds", 120) or 120))
+        for platform in platforms:
+            entry = state.setdefault(platform["id"], {"since": None, "alerted": False})
+            online, detail = await self.account_status(platform)
+            if online:
+                if entry["alerted"]:
+                    await self.alert(f"✅ 微信机器人（{platform['id']}）已恢复在线。")
+                entry.update(since=None, alerted=False)
+                continue
+            if entry["since"] is None:
+                entry["since"] = now
+            if not entry["alerted"] and now - entry["since"] >= delay:
+                entry["alerted"] = True
+                await self.alert(
+                    f"⚠️ 微信机器人（{platform['id']}）离线：{detail}。"
+                    "请确认小号仍在手机上登录，然后在服务器上重新登录桥接。"
+                )
+
+    async def watch_accounts(self, platforms):
+        state = {}
+        while True:
+            try:
+                await self.check_accounts(platforms, state, time.monotonic())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # keep the watcher alive
+                logger.error("WeChat offline watcher failed: %s", str(exc))
+            await asyncio.sleep(30)
+
+    async def alert(self, text):
+        logger.warning(text)
+        for session in self.alert_sessions():
+            try:
+                await self.context.send_message(session, MessageChain().message(text))
+            except Exception as exc:  # one broken session must not block others
+                logger.error("Could not send WeChat alert to %s: %s", session, str(exc))
 
     async def apply_group_persona(self, origin, profile, rule):
         """Apply a selection under the same lock used by incoming model requests.

@@ -8,6 +8,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from astrbot.api.event import MessageChain
+from astrbot.api.message_components import At, Plain
+
 from main import (
     NativeWeChatAdapter,
     NativeWeChatEvent,
@@ -95,6 +98,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 },
                 {"items": [event, event | {"cursor": "2"}]},
                 self.native,
+                {"state": "present", "member": {"displayName": "Person"}},
                 self.native,
                 asyncio.CancelledError(),
             ]
@@ -102,6 +106,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await self.adapter.run()
         self.assertEqual(self.adapter._event_queue.qsize(), 1)
+        sender = self.adapter._event_queue.get_nowait().message_obj.sender
+        self.assertEqual((sender.user_id, sender.nickname), ("wxid_person", "Person"))
         state = json.loads(Path(self.config["state_file"]).read_text())
         self.assertEqual(state["cursor"], "2")
         self.assertEqual(state["seen"], ["message1"])
@@ -169,6 +175,245 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         routes = manager.ucr.update_routing_data.await_args.args[0]
         self.assertEqual(routes["wechat-test:GroupMessage:123@chatroom"], "profile-id")
         self.assertEqual(routes["qq::"], "qq-profile")
+
+
+class ContextMessageTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = {
+            "id": "wechat-test",
+            "type": "native_wechat",
+            "enable": True,
+            "server_url": "http://127.0.0.1:6174",
+            "account_id": "account-test",
+            "allowed_groups": ["123@chatroom"],
+            "state_file": str(Path(self.temp.name) / "state.json"),
+            "token_file": str(Path(self.temp.name) / "token"),
+            "chat_provider_id": "test-model",
+            "context_messages": True,
+        }
+        Path(self.config["token_file"]).write_text("test")
+        self.adapter = NativeWeChatAdapter(self.config, {}, asyncio.Queue())
+        self.adapter.own_id = "wxid_bot"
+        self.plain = {
+            "id": "message2",
+            "accountId": "account-test",
+            "threadId": "123@chatroom",
+            "senderId": "wxid_person",
+            "type": 1,
+            "direction": "incoming",
+            "body": "我叫小明",
+            "mentions": {"state": "known", "self": False, "all": False},
+            "createdAt": datetime.now(UTC).isoformat(),
+        }
+
+    def test_unmentioned_text_is_context_without_at(self):
+        message = self.adapter.convert(self.plain, "live", require_mention=False)
+        self.assertIsNotNone(message)
+        self.assertFalse(any(isinstance(c, At) for c in message.message))
+        self.assertIsInstance(message.message[0], Plain)
+        self.assertIsNone(self.adapter.convert(self.plain, "live"))
+        mentioned = self.plain | {"mentions": {"state": "known", "self": True}}
+        message = self.adapter.convert(mentioned, "live", require_mention=False)
+        self.assertIsInstance(message.message[0], At)
+
+    def test_context_keeps_other_admission_rules(self):
+        variants = [
+            {"threadId": "other@chatroom"},
+            {"senderId": "wxid_bot"},
+            {"direction": "outgoing"},
+            {"type": 3},
+            {"recall": {"state": "recalled"}},
+            {"createdAt": (datetime.now(UTC) - timedelta(hours=1)).isoformat()},
+            {"body": "/reset"},
+            {"body": "  /new"},
+        ]
+        for change in variants:
+            with self.subTest(change=change):
+                self.assertIsNone(
+                    self.adapter.convert(self.plain | change, "live", False)
+                )
+        command = self.plain | {
+            "body": "/help",
+            "mentions": {"state": "known", "self": True},
+        }
+        self.assertIsNotNone(self.adapter.convert(command, "live", False))
+
+    async def test_context_messages_are_never_answered(self):
+        message = self.adapter.convert(self.plain, "live", require_mention=False)
+        event = NativeWeChatEvent(message, self.adapter)
+        self.adapter.reply = AsyncMock()
+        await event.send(MessageChain([Plain("插话")]))
+        self.adapter.reply.assert_not_awaited()
+
+    async def test_reply_requires_mention_even_for_context_source(self):
+        source = self.adapter.convert(self.plain, "live", require_mention=False)
+        self.adapter.request = AsyncMock(return_value=self.plain)
+        with self.assertRaises(ValueError):
+            await self.adapter.reply(source, "reply", "key")
+        posts = [x for x in self.adapter.request.await_args_list if x.args[0] == "POST"]
+        self.assertEqual(posts, [])
+
+    async def test_poll_uses_member_nickname(self):
+        event = {
+            "cursor": "1",
+            "kind": "message.committed",
+            "data": {
+                "threadId": "123@chatroom",
+                "messageId": "message2",
+                "origin": "live",
+            },
+        }
+        self.adapter.request = AsyncMock(
+            side_effect=[
+                {
+                    "authenticated": True,
+                    "ownUsername": "wxid_bot",
+                    "connection": "online",
+                },
+                {"items": [event]},
+                self.plain,
+                {
+                    "state": "present",
+                    "member": {"displayName": "小明", "roomDisplayName": None},
+                },
+                asyncio.CancelledError(),
+            ]
+        )
+        with self.assertRaises(asyncio.CancelledError):
+            await self.adapter.run()
+        committed = self.adapter._event_queue.get_nowait()
+        self.assertEqual(committed.message_obj.sender.user_id, "wxid_person")
+        self.assertEqual(committed.message_obj.sender.nickname, "小明")
+
+    async def test_member_name_cache_refresh_and_fallback(self):
+        self.adapter.request = AsyncMock(
+            side_effect=[
+                {"state": "absent", "member": None},
+                {"id": "refresh", "state": "queued"},
+                {"state": "absent", "member": None},
+            ]
+        )
+        self.assertEqual(
+            await self.adapter.member_name("123@chatroom", "wxid_new"), "wxid_new"
+        )
+        calls = self.adapter.request.await_args_list
+        self.assertEqual(calls[1].args[0], "POST")
+        self.assertTrue(calls[1].args[1].endswith("/members/refresh"))
+        # Cached fallback: no further bridge calls within its short TTL.
+        self.assertEqual(
+            await self.adapter.member_name("123@chatroom", "wxid_new"), "wxid_new"
+        )
+        self.assertEqual(len(self.adapter.request.await_args_list), 2)
+        self.adapter.member_names.clear()
+        await self.adapter.member_name("123@chatroom", "wxid_new")
+        # No second refresh within the refresh interval.
+        self.assertEqual(
+            [x.args[0] for x in self.adapter.request.await_args_list],
+            ["GET", "POST", "GET"],
+        )
+        self.adapter.request = AsyncMock(
+            side_effect=RuntimeError("WeChat bridge HTTP 500")
+        )
+        self.adapter.member_names.clear()
+        self.assertEqual(
+            await self.adapter.member_name("123@chatroom", "wxid_x"), "wxid_x"
+        )
+        self.adapter.resolve_member_names = False
+        self.assertEqual(
+            await self.adapter.member_name("1@chatroom", "wxid_y"), "wxid_y"
+        )
+
+
+class ProfileAndAlertTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.origin = "wechat:GroupMessage:1@chatroom"
+        self.platform = {"id": "wechat", "context_messages": True}
+        self.plugin = NativeWeChatPlugin(
+            SimpleNamespace(send_message=AsyncMock()),
+            {"alert_sessions": ["qq:FriendMessage:1", " "], "alert_after_seconds": 60},
+        )
+
+    def test_profile_defaults_whitelist_and_proactive_reply(self):
+        profile = Profile(
+            {
+                "platform_settings": {
+                    "enable_id_white_list": True,
+                    "id_whitelist": ["qq:FriendMessage:1"],
+                },
+                "provider_ltm_settings": {"active_reply": {"enable": True}},
+            }
+        )
+        self.assertTrue(
+            self.plugin.apply_profile_defaults(self.origin, profile, self.platform)
+        )
+        self.assertEqual(
+            profile["platform_settings"]["id_whitelist"],
+            ["qq:FriendMessage:1", self.origin],
+        )
+        self.assertFalse(profile["provider_ltm_settings"]["active_reply"]["enable"])
+        profile.save_config.assert_called_once()
+        self.assertFalse(
+            self.plugin.apply_profile_defaults(self.origin, profile, self.platform)
+        )
+        profile.save_config.assert_called_once()
+
+    def test_profile_defaults_leave_disabled_whitelist_and_mention_only_mode(self):
+        profile = Profile(
+            {
+                "platform_settings": {"enable_id_white_list": False},
+                "provider_ltm_settings": {"active_reply": {"enable": True}},
+            }
+        )
+        self.assertFalse(
+            self.plugin.apply_profile_defaults(
+                self.origin, profile, {"id": "wechat", "context_messages": False}
+            )
+        )
+        self.assertNotIn("id_whitelist", profile["platform_settings"])
+        self.assertTrue(profile["provider_ltm_settings"]["active_reply"]["enable"])
+
+    async def test_offline_alert_after_delay_then_recovery(self):
+        statuses = iter(
+            [(False, "账号已退出登录")] * 3 + [(True, "在线"), (True, "在线")]
+        )
+        self.plugin.account_status = AsyncMock(side_effect=lambda _: next(statuses))
+        state = {}
+        send = self.plugin.context.send_message
+        await self.plugin.check_accounts([self.platform], state, 0)
+        await self.plugin.check_accounts([self.platform], state, 30)
+        send.assert_not_awaited()
+        await self.plugin.check_accounts([self.platform], state, 61)
+        send.assert_awaited_once()
+        self.assertEqual(send.await_args.args[0], "qq:FriendMessage:1")
+        self.assertIn("离线", send.await_args.args[1].chain[0].text)
+        await self.plugin.check_accounts([self.platform], state, 90)
+        self.assertEqual(send.await_count, 2)
+        self.assertIn("恢复", send.await_args.args[1].chain[0].text)
+        await self.plugin.check_accounts([self.platform], state, 120)
+        self.assertEqual(send.await_count, 2)
+
+    async def test_brief_disconnect_does_not_alert(self):
+        statuses = iter([(False, "连接状态 connecting"), (True, "在线")])
+        self.plugin.account_status = AsyncMock(side_effect=lambda _: next(statuses))
+        state = {}
+        await self.plugin.check_accounts([self.platform], state, 0)
+        await self.plugin.check_accounts([self.platform], state, 30)
+        self.plugin.context.send_message.assert_not_awaited()
+
+    async def test_failed_alert_session_does_not_block_others(self):
+        self.plugin.config["alert_sessions"] = ["bad", "qq:FriendMessage:1"]
+        send = self.plugin.context.send_message
+        send.side_effect = [ValueError("bad session"), True]
+        await self.plugin.alert("test")
+        self.assertEqual(send.await_count, 2)
+
+    async def test_account_status_rejects_nonlocal_bridge(self):
+        online, detail = await self.plugin.account_status(
+            {"server_url": "https://example.com"}
+        )
+        self.assertFalse(online)
 
 
 class PersonaTests(unittest.IsolatedAsyncioTestCase):
