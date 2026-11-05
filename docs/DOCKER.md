@@ -1,6 +1,6 @@
 # Docker 部署（AstrBot 官方镜像 + agent-wechat 原生镜像）
 
-上游文档只覆盖源码运行的 AstrBot。插件写死了 `http://127.0.0.1:6174`，而 `wx serve` 也只接受回环地址监听，所以在 Docker 中让桥接容器**共用 AstrBot 容器的网络命名空间**即可，不需要改代码、也不对外开放端口。以下配置在 AstrBot v4.29.4（ARM64）与 `ghcr.io/thisnick/agent-wechat-native:v1.1.0` 上实测。
+上游文档只覆盖源码运行的 AstrBot。插件写死了 `http://127.0.0.1:6174`，而 `wx serve` 也只接受回环地址监听，所以在 Docker 中让桥接容器**共用 AstrBot 容器的网络命名空间**即可，不需要改代码、也不对外开放端口。以下配置在 AstrBot v4.29.4（ARM64）上实测：文字收发先在 agent-wechat v1.1.0、后在 v1.5.1 验证；发送图片需要 v1.3 及以上（实测 v1.5.1，原地升级保留登录态，升级前请备份 `wechat/data`）。
 
 ## 1. 目录与配置
 
@@ -27,7 +27,7 @@ tokenFile = "/run/agent-wechat/api-token"
 
 ```yaml
   wechat-bridge:
-    image: ghcr.io/thisnick/agent-wechat-native:v1.1.0
+    image: ghcr.io/thisnick/agent-wechat-native:v1.5.1
     restart: always
     network_mode: "service:astrbot"   # 与 AstrBot 共用 127.0.0.1
     user: "10001:10001"
