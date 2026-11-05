@@ -70,13 +70,13 @@ def is_self_mention(native):
     return mentions.get("state") == "known" and mentions.get("self") is True
 
 
-def clean_markdown(text):
+def clean_markdown(text, strip=True):
     """Remove Markdown markup that WeChat would show literally."""
     text = re.sub(r"^```[^\n]*\n?", "", text, flags=re.M)
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.S)
     text = re.sub(r"__(.+?)__", r"\1", text, flags=re.S)
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.M)
-    return text.strip()
+    return text.strip() if strip else text
 
 
 def utf16_len(text):
@@ -96,18 +96,28 @@ def image_mime(data):
 
 
 def outgoing_segments(chain, images=True):
-    """Split a message chain into ordered ("text", str) / ("image", Image) parts."""
-    segments, text = [], []
+    """Split a message chain into ordered text and image parts.
+
+    Text parts are token lists of ("plain", str) and ("at", user_id), so At
+    components (e.g. from send_message_to_user's mention_user) become real
+    WeChat mentions.
+    """
+    segments, tokens = [], []
+
+    def flush():
+        if any(k == "at" or v.strip() for k, v in tokens):
+            segments.append(("text", list(tokens)))
+        tokens.clear()
+
     for part in chain:
         if isinstance(part, Plain):
-            text.append(part.text)
+            tokens.append(("plain", part.text))
+        elif isinstance(part, At) and part.qq not in (None, "", "all"):
+            tokens.append(("at", str(part.qq)))
         elif images and isinstance(part, Image):
-            if "".join(text).strip():
-                segments.append(("text", "".join(text)))
-            text = []
+            flush()
             segments.append(("image", part))
-    if "".join(text).strip():
-        segments.append(("text", "".join(text)))
+    flush()
     return segments
 
 
@@ -151,7 +161,7 @@ class NativeWeChatEvent(AstrMessageEvent):
         parts = []
         async for message in generator:
             parts.extend(
-                part for part in message.chain if isinstance(part, Plain | Image)
+                part for part in message.chain if isinstance(part, Plain | Image | At)
             )
         if parts:
             await self.send(MessageChain(parts))
@@ -174,6 +184,7 @@ class NativeWeChatEvent(AstrMessageEvent):
         "mention_sender": False,
         "strip_markdown": True,
         "proactive_window_seconds": 120,
+        "proactive_messages": False,
         "show_member_ids": True,
         "text_mentions": False,
         "receive_media": True,
@@ -211,6 +222,9 @@ class NativeWeChatAdapter(Platform):
         )
         self.recent_mentions = {}
         self.proactive_sent = 0
+        # When enabled, any proactive send (scheduled reminders, plugins, the
+        # send_message_to_user tool) may reach the allowed groups at any time.
+        self.proactive_messages = bool(config.get("proactive_messages", False))
         # Nicknames can be changed to impersonate others; show the WeChat ID.
         self.show_member_ids = bool(config.get("show_member_ids", True))
         # Also treat a typed "@<bot group nickname>" as a mention (WeChat only
@@ -247,7 +261,8 @@ class NativeWeChatAdapter(Platform):
             "Local WeChat text adapter",
             self.config["id"],
             support_streaming_message=False,
-            support_proactive_message=False,
+            # Lets AstrBot offer send_message_to_user to the model.
+            support_proactive_message=self.proactive_messages,
         )
 
     async def request(self, method, path, **kwargs):
@@ -718,10 +733,17 @@ class NativeWeChatAdapter(Platform):
             or source.sender.nickname
             or user_id
             or ""
-        ).strip()
+        )
+        return self.make_mention(user_id, label)
+
+    def make_mention(self, user_id, label):
+        """Validate a mention target and label as the bridge requires them."""
+        label = (label or user_id or "").strip()
         if (
             not user_id
+            or user_id == self.own_id
             or not re.fullmatch(r"[A-Za-z0-9_@.-]{1,256}", user_id)
+            or user_id == "notify@all"
             or not label
             or len(label.encode()) > 1024
             or re.search(r"[\u0000-\u001f\u007f-\u009f\u2005]", label)
@@ -729,25 +751,70 @@ class NativeWeChatAdapter(Platform):
             return None
         return {"userId": user_id, "label": label}
 
+    async def compose_text(self, group, tokens, labels=None):
+        """Build a bridge text body from ("plain"|"at", value) tokens.
+
+        Mentions become "@label" + U+2005 with UTF-16 positions; unusable
+        targets fall back to plain "@label" text. Returns None when empty.
+        """
+        labels = dict(labels or {})
+        text, ids, positions = "", [], []
+        for kind, value in tokens:
+            if kind == "plain":
+                text += (
+                    clean_markdown(value, strip=False) if self.strip_markdown else value
+                )
+                continue
+            label = labels.get(value)
+            if not label:
+                label = await self.member_name(group, value)
+            mention = self.make_mention(value, label)
+            if not mention:
+                text += f"@{(label or value).strip()} "
+                continue
+            if value not in ids:
+                ids.append(value)
+            span = f"@{mention['label']}{MENTION_SEPARATOR}"
+            start = utf16_len(text)
+            text += span
+            positions.append(
+                {
+                    "start": start,
+                    "end": start + utf16_len(span),
+                    "index": ids.index(value),
+                }
+            )
+        # Trim ordinary whitespace only; a trailing U+2005 ends a mention.
+        trimmed = text.lstrip(" \t\r\n")
+        shift = utf16_len(text) - utf16_len(trimmed)
+        text = trimmed.rstrip(" \t\r\n")
+        if not text.strip():
+            return None
+        if not ids:
+            return {"threadId": group, "text": text}
+        for position in positions:
+            position["start"] -= shift
+            position["end"] -= shift
+        return {
+            "kind": "text",
+            "threadId": group,
+            "text": text,
+            "mentions": {"userIds": ids, "positions": positions},
+        }
+
     async def send_text(self, group, text, key, mention=None):
+        """Send text (a str or token list); `mention` @s that user first."""
         if group not in self.allowed_groups:
             raise ValueError("Reply target is not approved")
-        if self.strip_markdown:
-            text = clean_markdown(text)
-        if not text:
-            return
-        body = {"threadId": group, "text": text}
+        tokens = [("plain", text)] if isinstance(text, str) else list(text)
+        labels = {}
         if mention:
-            prefix = f"@{mention['label']}{MENTION_SEPARATOR}"
-            body = {
-                "kind": "text",
-                "threadId": group,
-                "text": prefix + text,
-                "mentions": {
-                    "userIds": [mention["userId"]],
-                    "positions": [{"start": 0, "end": utf16_len(prefix), "index": 0}],
-                },
-            }
+            labels[mention["userId"]] = mention["label"]
+            if ("at", mention["userId"]) not in tokens:
+                tokens.insert(0, ("at", mention["userId"]))
+        body = await self.compose_text(group, tokens, labels)
+        if not body:
+            return
         intent = await self.request(
             "POST", "/sends", headers={"Idempotency-Key": key}, json=body
         )
@@ -857,39 +924,79 @@ class NativeWeChatAdapter(Platform):
         self.member_names[key] = (name, time.monotonic() + ttl)
         return name
 
-    async def send_by_session(self, session, message_chain):
-        """Deliver plugin follow-ups (e.g. memes) right after a mention only.
+    def cron_payload(self, group):
+        """Payload of the scheduled task currently sending to `group`, if any.
 
-        Arbitrary proactive messages stay disabled: the target must be an
-        allowed group whose latest explicit mention is within
-        proactive_window_seconds, and that message must still be eligible.
+        AstrBot runs a cron job's agent inside event_context(CronMessageEvent),
+        so the job (and the member who created it) is visible while its
+        send_message_to_user call reaches this adapter.
+        """
+        try:
+            from astrbot.core.platform.astr_message_event import (
+                current_message_event,
+            )
+        except ImportError:
+            return None
+        event = current_message_event.get()
+        if event is None or event.get_platform_name() != "cron":
+            return None
+        payload = event.get_extra("cron_payload") or {}
+        if payload.get("session") != f"{self.config['id']}:GroupMessage:{group}":
+            return None
+        return payload
+
+    async def send_by_session(self, session, message_chain):
+        """Deliver proactive messages to an allowed group.
+
+        With proactive_messages enabled, anything may be sent to an allowed
+        group (scheduled reminders, plugins, send_message_to_user). Otherwise
+        only follow-ups (e.g. memes) within proactive_window_seconds of a
+        mention are allowed. Scheduled reminders @-mention their creator.
         """
         group = getattr(session, "session_id", None)
-        recent = self.recent_mentions.get(group)
         if (
             group not in self.allowed_groups
             or getattr(session, "message_type", None) != MessageType.GROUP_MESSAGE
-            or not recent
-            or time.monotonic() - recent[0] > self.proactive_window
         ):
+            raise ValueError("Proactive sending is limited to allowed WeChat groups")
+        recent = self.recent_mentions.get(group)
+        in_window = bool(
+            recent and time.monotonic() - recent[0] <= self.proactive_window
+        )
+        if not self.proactive_messages and not in_window:
             raise ValueError(
                 "Proactive sending is limited to groups mentioned in the last "
                 f"{self.proactive_window} seconds"
             )
-        source = recent[1]
         segments = outgoing_segments(message_chain.chain, self.send_images)
         if not segments:
             return
-        await self.ensure_reply_allowed(source)
+        if not self.proactive_messages:
+            await self.ensure_reply_allowed(recent[1])
+        mention = None
+        payload = self.cron_payload(group)
+        explicit = any(
+            k == "at" for kind, value in segments if kind == "text" for k, _ in value
+        )
+        if payload and self.mention_sender and not explicit:
+            creator = str(payload.get("sender_id") or "")
+            name = await self.member_name(group, creator) if creator else None
+            # Only @ a creator the group knows (not e.g. WebUI-created jobs).
+            if name and name != creator:
+                mention = self.make_mention(creator, name)
+        first_text = True
         for kind, value in segments:
             self.proactive_sent += 1
             key = hashlib.sha256(
-                f"{source.message_id}:follow-up:{self.proactive_sent}".encode()
+                f"proactive:{group}:{time.time_ns()}:{self.proactive_sent}".encode()
             ).hexdigest()
             if kind == "text":
-                await self.send_text(group, value, key)
+                await self.send_text(group, value, key, mention if first_text else None)
+                first_text = False
             else:
                 await self.send_image(group, value, key)
+        if payload:
+            logger.info("Native WeChat delivered a scheduled message to %s", group)
 
     async def terminate(self):
         if self.http and not self.http.closed:
@@ -897,7 +1004,7 @@ class NativeWeChatAdapter(Platform):
 
 
 @register(
-    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.5.1"
+    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.6.0"
 )
 class NativeWeChatPlugin(Star):
     def __init__(self, context, config=None):

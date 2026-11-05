@@ -22,5 +22,6 @@
   "show_member_ids": true,
   "text_mentions": false,
   "receive_media": true,
-  "attach_recent_image_seconds": 120
+  "attach_recent_image_seconds": 120,
+  "proactive_messages": false
 }
