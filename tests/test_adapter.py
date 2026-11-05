@@ -15,13 +15,33 @@ from astrbot.api.message_components import At, Image, Plain, Record
 from astrbot.api.platform import MessageType
 
 from main import (
+    CRON_DELIVERED_EXTRA,
     DEFAULT_STYLE_HINT,
     NativeWeChatAdapter,
     NativeWeChatEvent,
     NativeWeChatPlugin,
     clean_markdown,
+    cron_result_text,
     outgoing_segments,
 )
+
+
+class FakeCronEvent:
+    """Stand-in for AstrBot's CronMessageEvent (platform name "cron")."""
+
+    def __init__(self, payload, platform="cron"):
+        self.extras = {"cron_payload": payload}
+        self.platform = platform
+
+    def get_platform_name(self):
+        return self.platform
+
+    def get_extra(self, key, default=None):
+        return self.extras.get(key, default)
+
+    def set_extra(self, key, value):
+        self.extras[key] = value
+
 
 PNG_1X1 = bytes.fromhex(
     "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
@@ -895,14 +915,10 @@ class ProactiveAndMentionTests(unittest.IsolatedAsyncioTestCase):
     def cron(self, payload):
         from astrbot.core.platform.astr_message_event import current_message_event
 
-        event = SimpleNamespace(
-            get_platform_name=lambda: "cron",
-            get_extra=lambda key, default=None: (
-                payload if key == "cron_payload" else default
-            ),
-        )
+        event = FakeCronEvent(payload)
         token = current_message_event.set(event)
         self.addCleanup(current_message_event.reset, token)
+        return event
 
     def test_at_components_become_tokens(self):
         segments = outgoing_segments(
@@ -967,7 +983,7 @@ class ProactiveAndMentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.adapter.meta().support_proactive_message)
 
     async def test_scheduled_reminder_mentions_creator(self):
-        self.cron(
+        event = self.cron(
             {"session": "wechat-test:GroupMessage:123@chatroom", "sender_id": "wxid_a"}
         )
         self.adapter.send_text = AsyncMock()
@@ -977,6 +993,68 @@ class ProactiveAndMentionTests(unittest.IsolatedAsyncioTestCase):
         )
         call = self.adapter.send_text.await_args
         self.assertEqual(call.args[3], {"userId": "wxid_a", "label": "小明"})
+        self.assertTrue(event.get_extra(CRON_DELIVERED_EXTRA))
+
+    def test_cron_result_text_drops_status_remarks(self):
+        self.assertEqual(
+            cron_result_text("陈怀宇，该喝水了 💧\n\n（任务完成，提醒已送达。）"),
+            "陈怀宇，该喝水了 💧",
+        )
+        self.assertEqual(
+            cron_result_text("记得带伞（下午有雨）"), "记得带伞（下午有雨）"
+        )
+        self.assertEqual(cron_result_text("(已发送)"), "")
+
+    async def test_plugin_delivers_unsent_cron_answer_once(self):
+        from astrbot.core.platform.astr_message_event import current_message_event
+
+        manager = SimpleNamespace(
+            default_conf={
+                "platform": [
+                    {"id": "wechat-test", "type": "native_wechat", "enable": True}
+                ]
+            }
+        )
+        context = SimpleNamespace(astrbot_config_mgr=manager, send_message=AsyncMock())
+        plugin = NativeWeChatPlugin(context, {})
+        payload = {
+            "session": "wechat-test:GroupMessage:123@chatroom",
+            "sender_id": "wxid_a",
+        }
+        event = FakeCronEvent(payload)
+        resp = SimpleNamespace(
+            role="assistant", completion_text="该喝水了（提醒已送达）"
+        )
+        await plugin.deliver_cron_result(event, resp)
+        session, chain = context.send_message.await_args.args
+        self.assertEqual(session, "wechat-test:GroupMessage:123@chatroom")
+        self.assertEqual(chain.chain[0].text, "该喝水了")
+        self.assertTrue(event.get_extra(CRON_DELIVERED_EXTRA))
+        await plugin.deliver_cron_result(event, resp)  # already delivered
+        self.assertEqual(context.send_message.await_count, 1)
+        for other in (
+            FakeCronEvent(payload, platform="native_wechat"),
+            FakeCronEvent({"session": "qq:FriendMessage:1"}),
+            FakeCronEvent({"session": "other:GroupMessage:1@chatroom"}),
+        ):
+            await plugin.deliver_cron_result(other, resp)
+        self.assertEqual(context.send_message.await_count, 1)
+        # End to end: the fallback reaches the adapter inside the cron context.
+        fresh = FakeCronEvent(payload)
+        token = current_message_event.set(fresh)
+        self.addCleanup(current_message_event.reset, token)
+        self.adapter.send_text = AsyncMock()
+
+        async def route(session_str, chain):
+            await self.adapter.send_by_session(self.session, chain)
+            return True
+
+        context.send_message = AsyncMock(side_effect=route)
+        await plugin.deliver_cron_result(fresh, resp)
+        self.assertEqual(
+            self.adapter.send_text.await_args.args[3],
+            {"userId": "wxid_a", "label": "小明"},
+        )
 
     async def test_scheduled_reminder_respects_explicit_or_unknown_targets(self):
         self.cron(
