@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import At, Image, Plain
+from astrbot.api.message_components import At, Image, Plain, Record
 from astrbot.api.platform import MessageType
 
 from main import (
@@ -77,7 +77,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             {"accountId": "another-account"},
             {"direction": "outgoing"},
             {"senderId": "wxid_bot"},
-            {"type": 3},
+            {"type": 43},
             {"mentions": {"state": "unknown", "self": True}},
             {"mentions": {"state": "known", "all": True, "self": False}},
             {"createdAt": (datetime.now(UTC) - timedelta(hours=1)).isoformat()},
@@ -235,7 +235,7 @@ class ContextMessageTests(unittest.IsolatedAsyncioTestCase):
             {"threadId": "other@chatroom"},
             {"senderId": "wxid_bot"},
             {"direction": "outgoing"},
-            {"type": 3},
+            {"type": 43},
             {"recall": {"state": "recalled"}},
             {"createdAt": (datetime.now(UTC) - timedelta(hours=1)).isoformat()},
             {"body": "/reset"},
@@ -575,6 +575,259 @@ class OutgoingMediaTests(unittest.IsolatedAsyncioTestCase):
         empty = SimpleNamespace(system_prompt="人设")
         await plugin.add_wechat_style_hint(wechat, empty)
         self.assertEqual(empty.system_prompt, "人设")
+
+
+class IncomingMediaTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = {
+            "id": "wechat-test",
+            "type": "native_wechat",
+            "enable": True,
+            "server_url": "http://127.0.0.1:6174",
+            "account_id": "account-test",
+            "allowed_groups": ["123@chatroom"],
+            "state_file": str(Path(self.temp.name) / "state.json"),
+            "token_file": str(Path(self.temp.name) / "token"),
+            "chat_provider_id": "test-model",
+            "context_messages": True,
+        }
+        self.adapter = NativeWeChatAdapter(self.config, {}, asyncio.Queue())
+        self.adapter.own_id = "wxid_bot"
+        base = {
+            "accountId": "account-test",
+            "threadId": "123@chatroom",
+            "senderId": "wxid_person",
+            "direction": "incoming",
+            "body": None,
+            "mentions": {"state": "known", "self": False, "userIds": []},
+            "createdAt": datetime.now(UTC).isoformat(),
+        }
+        self.image = base | {"id": "img1", "type": 3, "serverId": "999"}
+        self.voice = base | {"id": "voice1", "type": 34}
+        self.sticker = base | {"id": "st1", "type": 47}
+        self.ask = base | {
+            "id": "ask1",
+            "type": 1,
+            "body": "@martyr 这是什么",
+            "mentions": {"state": "known", "self": True, "userIds": ["wxid_bot"]},
+        }
+        self.quote = base | {
+            "id": "q1",
+            "type": 49,
+            "appMessageType": 57,
+            "body": "@martyr 这张图里是什么",
+            "mentions": {"state": "known", "self": True, "userIds": ["wxid_bot"]},
+            "quote": {
+                "type": 3,
+                "serverId": "999",
+                "senderId": "wxid_other",
+                "embeddedText": None,
+            },
+        }
+
+    def test_media_is_admitted_only_as_context(self):
+        for native, kind, text in (
+            (self.image, "image", "[图片]"),
+            (self.voice, "voice", "[语音] "),
+            (self.sticker, "sticker", "[动画表情]"),
+        ):
+            with self.subTest(kind=kind):
+                message = self.adapter.convert(native, "live", require_mention=False)
+                self.assertEqual(message.wechat_kind, kind)
+                self.assertEqual(message.message_str, text)
+                self.assertFalse(any(isinstance(c, At) for c in message.message))
+                self.assertIsNone(self.adapter.convert(native, "live"))
+        video = self.image | {"type": 43}
+        self.assertIsNone(self.adapter.convert(video, "live", require_mention=False))
+        self.adapter.receive_media = False
+        self.assertIsNone(self.adapter.convert(self.image, "live", False))
+
+    def test_quote_reply_is_text_that_can_mention(self):
+        message = self.adapter.convert(self.quote, "live")
+        self.assertEqual(message.wechat_kind, "text")
+        self.assertIsInstance(message.message[0], At)
+        plain = self.quote | {
+            "body": "哈哈",
+            "mentions": {"state": "known", "self": False},
+        }
+        self.assertIsNone(self.adapter.convert(plain, "live"))
+        self.assertIsNotNone(self.adapter.convert(plain, "live", False))
+        other_app = self.quote | {"appMessageType": 5}
+        self.assertIsNone(self.adapter.convert(other_app, "live", False))
+
+    async def test_quote_note_names_quoted_author_and_content(self):
+        names = {"wxid_person": "小明", "wxid_other": "小红"}
+        self.adapter.member_name = AsyncMock(side_effect=lambda g, u: names[u])
+        message = self.adapter.convert(self.quote, "live")
+        await self.adapter.describe_people(message, self.quote)
+        self.assertTrue(
+            message.message_str.endswith("（引用了 小红(wxid_other) 的消息：[图片]）")
+        )
+        text_quote = self.quote | {
+            "quote": {"type": 1, "senderId": "wxid_bot", "embeddedText": "原话"}
+        }
+        message = self.adapter.convert(text_quote, "live")
+        await self.adapter.describe_people(message, text_quote)
+        self.assertIn("（引用了 你（机器人） 的消息：原话）", message.message_str)
+
+    async def test_download_waits_for_preferred_variant(self):
+        self.adapter.request = AsyncMock(
+            side_effect=[
+                {
+                    "items": [
+                        {
+                            "id": "a1",
+                            "kind": "image",
+                            "variant": "standard",
+                            "state": "pending",
+                        },
+                        {
+                            "id": "a2",
+                            "kind": "image",
+                            "variant": "thumbnail",
+                            "state": "available",
+                        },
+                    ]
+                },
+                {
+                    "items": [
+                        {
+                            "id": "a1",
+                            "kind": "image",
+                            "variant": "standard",
+                            "state": "available",
+                        }
+                    ]
+                },
+            ]
+        )
+        self.adapter.request_bytes = AsyncMock(return_value=PNG_1X1)
+        with patch("main.asyncio.sleep", AsyncMock()):
+            path = await self.adapter.download_media("img1", "image")
+        self.assertEqual(path.read_bytes(), PNG_1X1)
+        self.assertEqual(path.suffix, ".png")
+        self.assertEqual(path.parent, Path(self.temp.name) / "media")
+        self.assertIn(
+            "/media/a1/content", self.adapter.request_bytes.await_args.args[0]
+        )
+
+    async def test_download_falls_back_to_thumbnail_after_wait(self):
+        page = {
+            "items": [
+                {
+                    "id": "a1",
+                    "kind": "image",
+                    "variant": "standard",
+                    "state": "pending",
+                },
+                {
+                    "id": "a2",
+                    "kind": "image",
+                    "variant": "thumbnail",
+                    "state": "available",
+                },
+            ]
+        }
+        self.adapter.request = AsyncMock(return_value=page)
+        self.adapter.request_bytes = AsyncMock(return_value=PNG_1X1)
+        path = await self.adapter.download_media("img1", "image", wait=0)
+        self.assertIsNotNone(path)
+        self.assertIn(
+            "/media/a2/content", self.adapter.request_bytes.await_args.args[0]
+        )
+
+    async def test_download_gives_up_cleanly(self):
+        self.adapter.request = AsyncMock(
+            return_value={
+                "items": [
+                    {
+                        "id": "a",
+                        "kind": "image",
+                        "variant": "standard",
+                        "state": "failed",
+                    }
+                ]
+            }
+        )
+        self.assertIsNone(await self.adapter.download_media("img1", "image"))
+        self.adapter.request = AsyncMock(
+            side_effect=RuntimeError("WeChat bridge HTTP 409")
+        )
+        self.assertIsNone(await self.adapter.download_media("st1", "image"))
+        self.adapter.request = AsyncMock(
+            return_value={
+                "items": [
+                    {
+                        "id": "v",
+                        "kind": "voice",
+                        "variant": "normal",
+                        "state": "available",
+                    }
+                ]
+            }
+        )
+        self.adapter.request_bytes = AsyncMock(return_value=b"not wav")
+        self.assertIsNone(await self.adapter.download_media("voice1", "voice"))
+
+    async def test_attach_media_builds_image_record_or_placeholder(self):
+        png = Path(self.temp.name) / "x.png"
+        png.write_bytes(PNG_1X1)
+        self.adapter.download_media = AsyncMock(return_value=png)
+        image = self.adapter.convert(self.image, "live", False)
+        await self.adapter.attach_media(image)
+        self.assertEqual(len(image.message), 1)
+        self.assertIsInstance(image.message[0], Image)
+        voice = self.adapter.convert(self.voice, "live", False)
+        await self.adapter.attach_media(voice)
+        self.assertIsInstance(voice.message[0], Plain)
+        self.assertIsInstance(voice.message[1], Record)
+        self.adapter.download_media = AsyncMock(return_value=None)
+        failed = self.adapter.convert(self.image, "live", False)
+        await self.adapter.attach_media(failed)
+        self.assertEqual(failed.message[0].text, "[图片]（未能获取）")
+
+    def test_recent_image_is_attached_once_within_window(self):
+        self.adapter.remember_image(self.image)
+        ask = self.adapter.convert(self.ask, "live")
+        self.assertEqual(self.adapter.referenced_image(ask), "img1")
+        self.assertIsNone(self.adapter.referenced_image(ask))
+        self.adapter.remember_image(self.image)
+        other = self.adapter.convert(self.ask | {"senderId": "wxid_x"}, "live")
+        self.assertIsNone(self.adapter.referenced_image(other))
+        key = ("123@chatroom", "wxid_person")
+        self.adapter.recent_images[key] = (time.monotonic() - 500, "img1")
+        self.assertIsNone(self.adapter.referenced_image(ask))
+        context = self.adapter.convert(
+            self.ask | {"mentions": {"state": "known", "self": False}}, "live", False
+        )
+        self.adapter.remember_image(self.image)
+        self.assertIsNone(self.adapter.referenced_image(context))
+
+    def test_quoted_image_is_found_by_server_id(self):
+        self.adapter.remember_image(self.image | {"senderId": "wxid_other"})
+        quote = self.adapter.convert(self.quote, "live")
+        self.assertEqual(self.adapter.referenced_image(quote), "img1")
+        unknown = self.adapter.convert(
+            self.quote | {"quote": self.quote["quote"] | {"serverId": "1"}}, "live"
+        )
+        self.assertIsNone(self.adapter.referenced_image(unknown))
+
+    async def test_finish_and_commit_appends_image_and_always_dispatches(self):
+        png = Path(self.temp.name) / "x.png"
+        png.write_bytes(PNG_1X1)
+        self.adapter.download_media = AsyncMock(return_value=png)
+        ask = self.adapter.convert(self.ask, "live")
+        await self.adapter.finish_and_commit(ask, "img1")
+        event = self.adapter._event_queue.get_nowait()
+        self.assertIsInstance(event.message_obj.message[0], At)
+        self.assertIsInstance(event.message_obj.message[-1], Image)
+        self.assertIn("123@chatroom", self.adapter.recent_mentions)
+        self.adapter.download_media = AsyncMock(side_effect=OSError("disk"))
+        ask = self.adapter.convert(self.ask | {"id": "ask2"}, "live")
+        await self.adapter.finish_and_commit(ask, "img1")
+        self.assertEqual(self.adapter._event_queue.qsize(), 1)
 
 
 class ProfileAndAlertTests(unittest.IsolatedAsyncioTestCase):
