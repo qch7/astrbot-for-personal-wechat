@@ -589,6 +589,16 @@ class NativeWeChatAdapter(Platform):
         data = await self.request_bytes(
             "/media/" + quote(asset["id"], safe="") + "/content", limit
         )
+        expected = asset.get("byteLength")
+        if isinstance(expected, int) and len(data) != expected:
+            logger.warning(
+                "WeChat media is incomplete (%d of %d bytes)", len(data), expected
+            )
+            return None
+        checksum = asset.get("sha256")
+        if isinstance(checksum, str) and hashlib.sha256(data).hexdigest() != checksum:
+            logger.warning("WeChat media checksum does not match")
+            return None
         if kind == "image":
             _, extension = image_mime(data)
             if not extension:
@@ -617,13 +627,19 @@ class NativeWeChatAdapter(Platform):
                 pass
 
     async def request_bytes(self, path, limit):
+        """Read a whole response body (a single read() may return only part)."""
         async with self.http.get(self.base + self.prefix + path) as response:
             if response.status >= 400:
                 raise RuntimeError(f"WeChat bridge HTTP {response.status}")
-            data = await response.content.read(limit + 1)
-        if not data or len(data) > limit:
-            raise ValueError("WeChat media is empty or too large")
-        return data
+            chunks, size = [], 0
+            async for chunk in response.content.iter_chunked(65536):
+                size += len(chunk)
+                if size > limit:
+                    raise ValueError("WeChat media is too large")
+                chunks.append(chunk)
+        if not size:
+            raise ValueError("WeChat media is empty")
+        return b"".join(chunks)
 
     async def ensure_reply_allowed(self, source):
         """Re-read the source so recalled or ineligible messages get no reply."""
@@ -881,7 +897,7 @@ class NativeWeChatAdapter(Platform):
 
 
 @register(
-    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.5.0"
+    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.5.1"
 )
 class NativeWeChatPlugin(Star):
     def __init__(self, context, config=None):
