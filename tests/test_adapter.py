@@ -117,7 +117,9 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             await self.adapter.run()
         self.assertEqual(self.adapter._event_queue.qsize(), 1)
         sender = self.adapter._event_queue.get_nowait().message_obj.sender
-        self.assertEqual((sender.user_id, sender.nickname), ("wxid_person", "Person"))
+        self.assertEqual(
+            (sender.user_id, sender.nickname), ("wxid_person", "Person(wxid_person)")
+        )
         state = json.loads(Path(self.config["state_file"]).read_text())
         self.assertEqual(state["cursor"], "2")
         self.assertEqual(state["seen"], ["message1"])
@@ -295,7 +297,8 @@ class ContextMessageTests(unittest.IsolatedAsyncioTestCase):
             await self.adapter.run()
         committed = self.adapter._event_queue.get_nowait()
         self.assertEqual(committed.message_obj.sender.user_id, "wxid_person")
-        self.assertEqual(committed.message_obj.sender.nickname, "小明")
+        self.assertEqual(committed.message_obj.sender.nickname, "小明(wxid_person)")
+        self.assertEqual(committed.message_obj.wechat_sender_name, "小明")
 
     async def test_member_name_cache_refresh_and_fallback(self):
         self.adapter.request = AsyncMock(
@@ -413,6 +416,66 @@ class OutgoingMediaTests(unittest.IsolatedAsyncioTestCase):
         self.source.sender.nickname = "ok"
         self.adapter.mention_sender = False
         self.assertIsNone(self.adapter.mention_for(self.source))
+
+    def test_mention_label_uses_plain_nickname_not_id_form(self):
+        self.source.sender.nickname = "-(wxid_person)"
+        self.source.wechat_sender_name = "-"
+        self.assertEqual(
+            self.adapter.mention_for(self.source),
+            {"userId": "wxid_person", "label": "-"},
+        )
+
+    async def test_duplicate_nicknames_are_told_apart_by_id(self):
+        # Two members share the nickname "-"; the message mentions the other one.
+        native = self.native | {
+            "body": "@martyr\u2005@-\u2005\u8fd9\u4e2a\u662f\u732b\u5a18",
+            "mentions": {
+                "state": "known",
+                "self": True,
+                "userIds": ["wxid_bot", "wxid_other"],
+            },
+        }
+        message = self.adapter.convert(native, "live")
+        names = {"wxid_person": "-", "wxid_other": "-"}
+        self.adapter.member_name = AsyncMock(side_effect=lambda g, u: names[u])
+        await self.adapter.describe_people(message, native)
+        self.assertEqual(message.sender.nickname, "-(wxid_person)")
+        self.assertEqual(message.wechat_sender_name, "-")
+        self.assertTrue(
+            message.message_str.endswith(
+                "\uff08\u8fd9\u6761\u6d88\u606f@\u4e86\uff1a-(wxid_other)\uff09"
+            )
+        )
+        plain = [p for p in message.message if isinstance(p, Plain)][0]
+        self.assertTrue(plain.text.endswith("-(wxid_other)\uff09"))
+        self.adapter.show_member_ids = False
+        message = self.adapter.convert(native, "live")
+        await self.adapter.describe_people(message, native)
+        self.assertEqual(message.sender.nickname, "-")
+        self.assertNotIn("\u8fd9\u6761\u6d88\u606f@\u4e86", message.message_str)
+
+    def test_typed_bot_nickname_counts_as_mention_when_enabled(self):
+        typed = self.native | {
+            "body": "@martyr\u2005\u90a3\u4f60\u77e5\u4e0d\u77e5\u9053\u662f\u8c01",
+            "mentions": {"state": "known", "self": False, "userIds": []},
+        }
+        self.assertIsNone(self.adapter.convert(typed, "live"))
+        self.adapter.text_mentions = True
+        self.assertIsNone(self.adapter.convert(typed, "live"))  # own name unknown
+        self.adapter.member_names[("123@chatroom", "wxid_bot")] = (
+            "martyr",
+            time.monotonic() + 60,
+        )
+        message = self.adapter.convert(typed, "live")
+        self.assertIsInstance(message.message[0], At)
+        self.assertIsNone(
+            self.adapter.convert(
+                typed | {"body": "@martyrs \u4e0d\u662f\u6211"}, "live"
+            )
+        )
+        self.assertIsNotNone(
+            self.adapter.convert(typed | {"body": "hi @martyr"}, "live")
+        )
 
     async def test_image_upload_send_and_job_wait(self):
         self.adapter.request = AsyncMock(

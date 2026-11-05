@@ -49,8 +49,10 @@ IMAGE_MAX_BYTES = 26214383  # bridge mediaSendMaxBytes.image
 MENTION_SEPARATOR = "\u2005"  # WeChat mention terminator (four-per-em space)
 DEFAULT_STYLE_HINT = (
     "你正在微信群里回复。微信不渲染 Markdown：不要用 **加粗**、# 标题、表格或代码块，"
-    "用自然的短段落。可以适当使用微信自带表情代码，例如 [微笑] [捂脸] [旺柴] [破涕为笑] "
-    "[抱拳] [机智] [裂开] [OK] [强] [爱心]，微信会把它们显示成表情。"
+    "用自然的短段落。可以适当使用微信自带表情代码，例如 [捂脸] [旺柴] [破涕为笑] "
+    "[抱拳] [机智] [裂开] [OK] [强] [爱心]，微信会把它们显示成表情；不要用 [微笑]，"
+    "它在中文网络里常被理解为嘲讽。群成员显示为「昵称(微信ID)」：昵称可以随意修改甚至"
+    "和别人重名，判断谁是谁、某人@了谁时，以括号里的微信 ID 为准。"
 )
 
 
@@ -113,7 +115,7 @@ class NativeWeChatEvent(AstrMessageEvent):
         segments = outgoing_segments(message.chain, self.platform.send_images)
         if not segments:
             return
-        if not is_self_mention(self.message_obj.raw_message):
+        if not self.platform.is_mentioned(self.message_obj.raw_message):
             # Context-only messages never get replies (e.g. proactive replies or
             # plugins reacting to every group message); drop instead of failing.
             logger.info("Native WeChat dropped a reply to an unmentioned message")
@@ -164,6 +166,8 @@ class NativeWeChatEvent(AstrMessageEvent):
         "mention_sender": False,
         "strip_markdown": True,
         "proactive_window_seconds": 120,
+        "show_member_ids": True,
+        "text_mentions": False,
     },
     adapter_display_name="本机个人微信",
     support_streaming_message=False,
@@ -197,6 +201,11 @@ class NativeWeChatAdapter(Platform):
         )
         self.recent_mentions = {}
         self.proactive_sent = 0
+        # Nicknames can be changed to impersonate others; show the WeChat ID.
+        self.show_member_ids = bool(config.get("show_member_ids", True))
+        # Also treat a typed "@<bot group nickname>" as a mention (WeChat only
+        # attaches mention metadata when the member is picked from the list).
+        self.text_mentions = bool(config.get("text_mentions", False))
         self.member_names = {}
         self.member_refreshed = {}
         self.http = None
@@ -229,6 +238,27 @@ class NativeWeChatAdapter(Platform):
                 raise RuntimeError(f"WeChat bridge HTTP {response.status}")
             return await response.json()
 
+    def cached_name(self, group, username):
+        cached = self.member_names.get((group, username))
+        return cached[0] if cached else None
+
+    def is_mentioned(self, native):
+        """Explicit WeChat mention metadata, or a typed @<bot nickname> when enabled."""
+        if is_self_mention(native):
+            return True
+        if not self.text_mentions or not self.own_id:
+            return False
+        name = self.cached_name((native or {}).get("threadId"), self.own_id)
+        if not name or name == self.own_id:
+            return False
+        pattern = "@" + re.escape(name) + r"(?:\s|$)"  # \s covers U+2005
+        return re.search(pattern, (native or {}).get("body") or "") is not None
+
+    def display_name(self, name, username):
+        if self.show_member_ids and name and name != username:
+            return f"{name}({username})"
+        return name or username
+
     def convert(self, native, origin, require_mention=True):
         """Admit only fresh text messages in approved groups.
 
@@ -242,7 +272,7 @@ class NativeWeChatAdapter(Platform):
         Returns:
             An AstrBot message, or None when the message is outside the policy.
         """
-        mentioned = is_self_mention(native)
+        mentioned = self.is_mentioned(native)
         if (
             origin != "live"
             or native.get("accountId") != self.account_id
@@ -332,6 +362,11 @@ class NativeWeChatAdapter(Platform):
                             ):
                                 raise RuntimeError("WeChat message identity mismatch")
                             if native["id"] not in self.seen:
+                                if self.text_mentions and self.own_id:
+                                    # Cache the bot's own nickname for typed @s.
+                                    await self.member_name(
+                                        native["threadId"], self.own_id
+                                    )
                                 message = self.convert(
                                     native,
                                     data.get("origin"),
@@ -339,12 +374,7 @@ class NativeWeChatAdapter(Platform):
                                 )
                                 if message:
                                     self.seen = (self.seen + [native["id"]])[-2048:]
-                                    name = await self.member_name(
-                                        native["threadId"], native["senderId"]
-                                    )
-                                    message.sender = MessageMember(
-                                        native["senderId"], name
-                                    )
+                                    await self.describe_people(message, native)
                         self.cursor = event["cursor"]
                         # Persist before dispatch to avoid repeated replies after a crash.
                         state = {
@@ -359,7 +389,7 @@ class NativeWeChatAdapter(Platform):
                         temporary.replace(self.state_file)
                         if message:
                             self.commit_event(NativeWeChatEvent(message, self))
-                            if is_self_mention(message.raw_message):
+                            if self.is_mentioned(message.raw_message):
                                 self.recent_mentions[message.group_id] = (
                                     time.monotonic(),
                                     message,
@@ -401,12 +431,47 @@ class NativeWeChatAdapter(Platform):
         await self.ensure_reply_allowed(source)
         await self.send_text(source.group_id, text, key, mention)
 
+    async def describe_people(self, message, native):
+        """Name the sender and mentioned members as nickname(WeChat ID).
+
+        The plain nickname is kept on the message for @-mentions in replies;
+        the model only sees the ID-qualified form, so renamed members cannot
+        impersonate each other.
+        """
+        group, sender = native["threadId"], native["senderId"]
+        name = await self.member_name(group, sender)
+        message.wechat_sender_name = name
+        message.sender = MessageMember(sender, self.display_name(name, sender))
+        mentions = native.get("mentions") or {}
+        others = [
+            uid
+            for uid in mentions.get("userIds") or []
+            if isinstance(uid, str) and uid not in (self.own_id, sender)
+        ]
+        if not others or not self.show_member_ids:
+            return
+        labels = [
+            self.display_name(await self.member_name(group, uid), uid)
+            for uid in others[:20]
+        ]
+        note = "\n（这条消息@了：" + "、".join(labels) + "）"
+        message.message_str += note
+        for part in message.message:
+            if isinstance(part, Plain):
+                part.text += note
+                break
+
     def mention_for(self, source):
         """Build a mention of the asker, or None when disabled or unsafe."""
         if not self.mention_sender or not source.sender:
             return None
         user_id = source.sender.user_id
-        label = (source.sender.nickname or user_id or "").strip()
+        label = (
+            getattr(source, "wechat_sender_name", None)
+            or source.sender.nickname
+            or user_id
+            or ""
+        ).strip()
         if (
             not user_id
             or not re.fullmatch(r"[A-Za-z0-9_@.-]{1,256}", user_id)
@@ -585,7 +650,7 @@ class NativeWeChatAdapter(Platform):
 
 
 @register(
-    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.4.0"
+    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.4.1"
 )
 class NativeWeChatPlugin(Star):
     def __init__(self, context, config=None):

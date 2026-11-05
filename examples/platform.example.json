@@ -18,5 +18,7 @@
   "send_images": true,
   "mention_sender": false,
   "strip_markdown": true,
-  "proactive_window_seconds": 120
+  "proactive_window_seconds": 120,
+  "show_member_ids": true,
+  "text_mentions": false
 }
