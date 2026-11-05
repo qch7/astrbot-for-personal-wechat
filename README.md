@@ -4,7 +4,7 @@
 
 这是一个社区实验性适配器，使用本机运行的 `agent-wechat` 原生服务；不是腾讯官方机器人接口，也不是 AstrBot 官方内置微信适配器。本仓库提供 Python 插件、配置辅助脚本和部署文档，不包含微信客户端、桥接二进制、账号资料或模型密钥。
 
-> **本仓库是 [shuizhaodemumu/astrbot-for-personal-wechat](https://github.com/shuizhaodemumu/astrbot-for-personal-wechat) 的 fork（0.4.1）**，在 0.2.0 基础上增加：
+> **本仓库是 [shuizhaodemumu/astrbot-for-personal-wechat](https://github.com/shuizhaodemumu/astrbot-for-personal-wechat) 的 fork（0.5.1）**，在 0.2.0 基础上增加：
 >
 > - **群聊上下文**：平台配置 `context_messages: true` 时，白名单群里没有 @ 的文字也交给 AstrBot，供「群聊上下文感知」记录；这些消息不带 At，不会唤醒模型，也永远不会被回复（插件会丢弃针对它们的回复）。以 `context_skip_prefixes`（默认 `["/"]`）开头的未 @ 文字不转发，群成员不能绕过 @ 执行指令。
 > - **群昵称**：`resolve_member_names`（默认开）从桥接读取群成员昵称作为发送者名称，查不到时退回微信 ID；结果缓存一小时。
@@ -13,7 +13,10 @@
 > - **图片回复（0.4）**：回复中的图片经桥接上传后发送（需要 agent-wechat ≥ 1.3，实测 1.5.1）。`meme_manager` 等插件的补发只在该白名单群最近一次 @ 后 `proactive_window_seconds`（默认 120 秒）内放行，其余主动发送仍被拒绝。
 > - **回复体验（0.4）**：`mention_sender` 让回复 @ 提问者；`strip_markdown`（默认开）去掉微信会原样显示的 Markdown；插件配置 `reply_style_hint` 追加到微信群的模型请求，提示不用 Markdown、可用 `[旺柴]` 等微信表情代码、不用 `[微笑]`。
 > - **身份识别（0.4.1）**：`show_member_ids`（默认开）把成员显示为「昵称(wxid)」，昵称重名或冒充也能区分；消息 @ 了其他成员时附注被 @ 者；`text_mentions` 让手打的「@机器人群昵称」也算 @（微信只有从成员列表选择时才附带 @ 元数据）。
+> - **接收图片和语音（0.5）**：`receive_media`（默认开，需同时开启 `context_messages`）把群里的图片、语音作为群聊上下文交给 AstrBot：图片从桥接下载（优先 standard，原图仍在下载时最多等 15 秒，再退回缩略图），并校验大小与 SHA-256；语音是桥接解码好的 WAV，需要在该群配置里开启 AstrBot 的语音转文字（实测硅基流动 `FunAudioLLM/SenseVoiceSmall`，类型 OpenAI Whisper API）。动画表情记为「[动画表情]」。图片和语音无法 @，所以 @ 机器人时会附上被引用的图片，或提问者 `attach_recent_image_seconds`（默认 120 秒）内自己发的最后一张图（只附一次）。引用回复（type 49）现在当作文字处理，可以 @ 机器人，并注明引用了谁的什么内容。
 > - **Docker 部署**：见 [docs/DOCKER.md](docs/DOCKER.md)。
+>
+> 安全提示：AstrBot 的本地代码执行（`computer_use_local_permissions`）如果对普通成员开放，任何群成员 @ 机器人都可能让它在 AstrBot 所在环境执行命令、读取包含 API key 和桥接令牌的配置文件。建议普通成员关闭执行并把文件范围限制为 `workspace`。
 
 ## 工作方式
 
