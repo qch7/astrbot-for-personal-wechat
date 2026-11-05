@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -9,12 +10,21 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import At, Plain
+from astrbot.api.message_components import At, Image, Plain
+from astrbot.api.platform import MessageType
 
 from main import (
+    DEFAULT_STYLE_HINT,
     NativeWeChatAdapter,
     NativeWeChatEvent,
     NativeWeChatPlugin,
+    clean_markdown,
+    outgoing_segments,
+)
+
+PNG_1X1 = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+    "0000000c49444154789c63f8cfc000000301010018dd8db40000000049454e44ae426082"
 )
 
 
@@ -243,9 +253,9 @@ class ContextMessageTests(unittest.IsolatedAsyncioTestCase):
     async def test_context_messages_are_never_answered(self):
         message = self.adapter.convert(self.plain, "live", require_mention=False)
         event = NativeWeChatEvent(message, self.adapter)
-        self.adapter.reply = AsyncMock()
-        await event.send(MessageChain([Plain("插话")]))
-        self.adapter.reply.assert_not_awaited()
+        self.adapter.request = AsyncMock()
+        await event.send(MessageChain([Plain("插话"), Image.fromFileSystem("x.png")]))
+        self.adapter.request.assert_not_awaited()
 
     async def test_reply_requires_mention_even_for_context_source(self):
         source = self.adapter.convert(self.plain, "live", require_mention=False)
@@ -324,6 +334,184 @@ class ContextMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await self.adapter.member_name("1@chatroom", "wxid_y"), "wxid_y"
         )
+
+
+class OutgoingMediaTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = {
+            "id": "wechat-test",
+            "type": "native_wechat",
+            "enable": True,
+            "server_url": "http://127.0.0.1:6174",
+            "account_id": "account-test",
+            "allowed_groups": ["123@chatroom"],
+            "state_file": str(Path(self.temp.name) / "state.json"),
+            "token_file": str(Path(self.temp.name) / "token"),
+            "chat_provider_id": "test-model",
+            "mention_sender": True,
+        }
+        self.adapter = NativeWeChatAdapter(self.config, {}, asyncio.Queue())
+        self.adapter.own_id = "wxid_bot"
+        self.native = {
+            "id": "message1",
+            "accountId": "account-test",
+            "threadId": "123@chatroom",
+            "senderId": "wxid_person",
+            "type": 1,
+            "direction": "incoming",
+            "body": "@bot 来个表情",
+            "mentions": {"state": "known", "self": True, "all": False},
+            "createdAt": datetime.now(UTC).isoformat(),
+        }
+        self.source = self.adapter.convert(self.native, "live")
+        self.source.sender.nickname = "小明😀"
+        self.png = Path(self.temp.name) / "meme.png"
+        self.png.write_bytes(PNG_1X1)
+        self.accepted = {
+            "id": "send1",
+            "state": "server_accepted",
+            "accountId": "account-test",
+            "destination": "123@chatroom",
+        }
+        self.job_done = {
+            "id": "job1",
+            "state": "completed",
+            "accountId": "account-test",
+            "threadId": "123@chatroom",
+        }
+
+    def test_segments_and_markdown_cleanup(self):
+        image = Image.fromFileSystem(str(self.png))
+        segments = outgoing_segments([Plain("a"), Plain("b"), image, Plain(" ")])
+        self.assertEqual(segments, [("text", "ab"), ("image", image)])
+        self.assertEqual(outgoing_segments([image], images=False), [])
+        self.assertEqual(
+            clean_markdown("## 标题\n**重点** 和 __强调__\n```py\ncode\n```"),
+            "标题\n重点 和 强调\ncode",
+        )
+
+    async def test_text_reply_mentions_asker_with_utf16_positions(self):
+        self.adapter.request = AsyncMock(side_effect=[self.native, self.accepted])
+        await self.adapter.reply(
+            self.source, "**你好**", "key", self.adapter.mention_for(self.source)
+        )
+        body = self.adapter.request.await_args_list[1].kwargs["json"]
+        prefix = "@小明😀\u2005"
+        self.assertEqual(body["kind"], "text")
+        self.assertEqual(body["text"], prefix + "你好")
+        self.assertEqual(body["mentions"]["userIds"], ["wxid_person"])
+        # The emoji is two UTF-16 code units, as the bridge counts positions.
+        self.assertEqual(
+            body["mentions"]["positions"], [{"start": 0, "end": 6, "index": 0}]
+        )
+
+    def test_unsafe_or_disabled_mentions_are_skipped(self):
+        self.source.sender.nickname = "bad\u2005name"
+        self.assertIsNone(self.adapter.mention_for(self.source))
+        self.source.sender.nickname = "ok"
+        self.adapter.mention_sender = False
+        self.assertIsNone(self.adapter.mention_for(self.source))
+
+    async def test_image_upload_send_and_job_wait(self):
+        self.adapter.request = AsyncMock(
+            side_effect=[
+                {"id": "upload_1", "mediaType": "image/png"},
+                {"id": "job1", "state": "queued", "accountId": "account-test"},
+                self.job_done,
+            ]
+        )
+        with patch("main.asyncio.sleep", AsyncMock()):
+            await self.adapter.send_image(
+                "123@chatroom", Image.fromFileSystem(str(self.png)), "img-key"
+            )
+        upload, send, poll = self.adapter.request.await_args_list
+        self.assertEqual(upload.args[:2], ("POST", "/uploads"))
+        self.assertEqual(send.kwargs["json"]["kind"], "image")
+        self.assertEqual(send.kwargs["json"]["sourceId"], "upload_1")
+        self.assertEqual(send.kwargs["headers"]["Idempotency-Key"], "img-key")
+        self.assertEqual(poll.args, ("GET", "/jobs/job1"))
+
+    async def test_image_failures_are_not_reported_as_sent(self):
+        self.adapter.request = AsyncMock(
+            side_effect=[{"id": "upload_1"}, self.job_done | {"state": "failed"}]
+        )
+        with self.assertRaises(RuntimeError):
+            await self.adapter.send_image(
+                "123@chatroom", Image.fromFileSystem(str(self.png)), "k"
+            )
+        bad = Path(self.temp.name) / "bad.png"
+        bad.write_bytes(b"not an image")
+        self.adapter.request = AsyncMock()
+        with self.assertRaises(ValueError):
+            await self.adapter.send_image(
+                "123@chatroom", Image.fromFileSystem(str(bad)), "k"
+            )
+        with self.assertRaises(ValueError):
+            await self.adapter.send_image(
+                "other@chatroom", Image.fromFileSystem(str(self.png)), "k"
+            )
+        self.adapter.request.assert_not_awaited()
+
+    async def test_event_send_checks_once_then_sends_text_and_image(self):
+        event = NativeWeChatEvent(self.source, self.adapter)
+        self.adapter.ensure_reply_allowed = AsyncMock()
+        self.adapter.send_text = AsyncMock()
+        self.adapter.send_image = AsyncMock()
+        image = Image.fromFileSystem(str(self.png))
+        await event.send(MessageChain([Plain("给你"), image]))
+        self.adapter.ensure_reply_allowed.assert_awaited_once()
+        text_call = self.adapter.send_text.await_args
+        self.assertEqual(text_call.args[1], "给你")
+        self.assertEqual(text_call.args[3]["userId"], "wxid_person")
+        self.adapter.send_image.assert_awaited_once()
+        self.assertIs(self.adapter.send_image.await_args.args[1], image)
+        await event.send(MessageChain([Plain("第二条")]))
+        self.assertIsNone(self.adapter.send_text.await_args.args[3])
+
+    async def test_follow_up_only_shortly_after_a_mention(self):
+        session = SimpleNamespace(
+            session_id="123@chatroom", message_type=MessageType.GROUP_MESSAGE
+        )
+        chain = MessageChain([Image.fromFileSystem(str(self.png))])
+        self.adapter.ensure_reply_allowed = AsyncMock()
+        self.adapter.send_image = AsyncMock()
+        with self.assertRaises(ValueError):
+            await self.adapter.send_by_session(session, chain)
+        self.adapter.recent_mentions["123@chatroom"] = (time.monotonic(), self.source)
+        await self.adapter.send_by_session(session, chain)
+        self.adapter.ensure_reply_allowed.assert_awaited_once_with(self.source)
+        self.adapter.send_image.assert_awaited_once()
+        self.adapter.recent_mentions["123@chatroom"] = (
+            time.monotonic() - 500,
+            self.source,
+        )
+        with self.assertRaises(ValueError):
+            await self.adapter.send_by_session(session, chain)
+        other = SimpleNamespace(
+            session_id="other@chatroom", message_type=MessageType.GROUP_MESSAGE
+        )
+        self.adapter.recent_mentions["other@chatroom"] = (time.monotonic(), self.source)
+        with self.assertRaises(ValueError):
+            await self.adapter.send_by_session(other, chain)
+        self.assertEqual(self.adapter.send_image.await_count, 1)
+
+    async def test_style_hint_only_for_wechat_requests(self):
+        plugin = NativeWeChatPlugin(SimpleNamespace(), {})
+        req = SimpleNamespace(system_prompt="人设")
+        wechat = SimpleNamespace(get_platform_name=lambda: "native_wechat")
+        await plugin.add_wechat_style_hint(wechat, req)
+        self.assertEqual(req.system_prompt, "人设\n\n" + DEFAULT_STYLE_HINT)
+        other = SimpleNamespace(system_prompt="人设")
+        await plugin.add_wechat_style_hint(
+            SimpleNamespace(get_platform_name=lambda: "aiocqhttp"), other
+        )
+        self.assertEqual(other.system_prompt, "人设")
+        plugin.config["reply_style_hint"] = " "
+        empty = SimpleNamespace(system_prompt="人设")
+        await plugin.add_wechat_style_hint(wechat, empty)
+        self.assertEqual(empty.system_prompt, "人设")
 
 
 class ProfileAndAlertTests(unittest.IsolatedAsyncioTestCase):
