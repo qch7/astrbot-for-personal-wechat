@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 shuizhaodemumu
 # Modified 2026 by qch7 (fork): group context messages, member nicknames,
-# per-group whitelist/profile defaults and bot-offline alerts.
+# per-group whitelist/profile defaults, bot-offline alerts, image replies,
+# @-mentioning the asker and WeChat reply-style hints.
 
 import asyncio
 import copy
 import hashlib
 import json
+import re
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,7 +17,8 @@ from urllib.parse import quote
 import aiohttp
 from astrbot.api import logger, sp
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import At, Plain
+from astrbot.api.event import filter as event_filter
+from astrbot.api.message_components import At, Image, Plain
 from astrbot.api.platform import (
     AstrBotMessage,
     AstrMessageEvent,
@@ -33,10 +36,69 @@ MEMBER_NAME_TTL = 3600
 MEMBER_REFRESH_INTERVAL = 600
 
 
+MEDIA_SUCCESS_STATES = {"accepted", "completed", "succeeded"}
+MEDIA_TERMINAL_STATES = MEDIA_SUCCESS_STATES | {
+    "available",
+    "failed",
+    "partial",
+    "cancelled",
+    "expired",
+    "needs_review",
+}
+IMAGE_MAX_BYTES = 26214383  # bridge mediaSendMaxBytes.image
+MENTION_SEPARATOR = "\u2005"  # WeChat mention terminator (four-per-em space)
+DEFAULT_STYLE_HINT = (
+    "你正在微信群里回复。微信不渲染 Markdown：不要用 **加粗**、# 标题、表格或代码块，"
+    "用自然的短段落。可以适当使用微信自带表情代码，例如 [微笑] [捂脸] [旺柴] [破涕为笑] "
+    "[抱拳] [机智] [裂开] [OK] [强] [爱心]，微信会把它们显示成表情。"
+)
+
+
 def is_self_mention(native):
     """Return whether a native message explicitly mentions the bot account."""
     mentions = (native or {}).get("mentions") or {}
     return mentions.get("state") == "known" and mentions.get("self") is True
+
+
+def clean_markdown(text):
+    """Remove Markdown markup that WeChat would show literally."""
+    text = re.sub(r"^```[^\n]*\n?", "", text, flags=re.M)
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.S)
+    text = re.sub(r"__(.+?)__", r"\1", text, flags=re.S)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.M)
+    return text.strip()
+
+
+def utf16_len(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+def image_mime(data):
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", "jpg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif", "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    return None, None
+
+
+def outgoing_segments(chain, images=True):
+    """Split a message chain into ordered ("text", str) / ("image", Image) parts."""
+    segments, text = [], []
+    for part in chain:
+        if isinstance(part, Plain):
+            text.append(part.text)
+        elif images and isinstance(part, Image):
+            if "".join(text).strip():
+                segments.append(("text", "".join(text)))
+            text = []
+            segments.append(("image", part))
+    if "".join(text).strip():
+        segments.append(("text", "".join(text)))
+    return segments
 
 
 class NativeWeChatEvent(AstrMessageEvent):
@@ -48,32 +110,46 @@ class NativeWeChatEvent(AstrMessageEvent):
         self.delivery = 0
 
     async def send(self, message: MessageChain):
-        text = "".join(part.text for part in message.chain if isinstance(part, Plain))
-        if not text.strip():
+        segments = outgoing_segments(message.chain, self.platform.send_images)
+        if not segments:
             return
         if not is_self_mention(self.message_obj.raw_message):
             # Context-only messages never get replies (e.g. proactive replies or
             # plugins reacting to every group message); drop instead of failing.
             logger.info("Native WeChat dropped a reply to an unmentioned message")
             return
-        key = hashlib.sha256(
-            f"{self.message_obj.message_id}:{self.delivery}".encode()
-        ).hexdigest()
-        self.delivery += 1
-        await self.platform.reply(self.message_obj, text, key)
+        await self.platform.ensure_reply_allowed(self.message_obj)
+        for kind, value in segments:
+            key = hashlib.sha256(
+                f"{self.message_obj.message_id}:{self.delivery}".encode()
+            ).hexdigest()
+            # Only the first text part of the first reply @-mentions the asker.
+            mention = self.delivery == 0 and kind == "text"
+            self.delivery += 1
+            if kind == "text":
+                await self.platform.send_text(
+                    self.message_obj.group_id,
+                    value,
+                    key,
+                    self.platform.mention_for(self.message_obj) if mention else None,
+                )
+            else:
+                await self.platform.send_image(self.message_obj.group_id, value, key)
         await super().send(message)
 
     async def send_streaming(self, generator, use_fallback=False):
         parts = []
         async for message in generator:
-            parts.extend(part for part in message.chain if isinstance(part, Plain))
+            parts.extend(
+                part for part in message.chain if isinstance(part, Plain | Image)
+            )
         if parts:
             await self.send(MessageChain(parts))
 
 
 @register_platform_adapter(
     "native_wechat",
-    "本机个人微信：指定群 @ 回复（文字）",
+    "本机个人微信：指定群 @ 回复（文字、图片）",
     default_config_tmpl={
         "server_url": "http://127.0.0.1:6174",
         "account_id": "",
@@ -84,6 +160,10 @@ class NativeWeChatEvent(AstrMessageEvent):
         "context_messages": False,
         "context_skip_prefixes": ["/"],
         "resolve_member_names": True,
+        "send_images": True,
+        "mention_sender": False,
+        "strip_markdown": True,
+        "proactive_window_seconds": 120,
     },
     adapter_display_name="本机个人微信",
     support_streaming_message=False,
@@ -107,6 +187,16 @@ class NativeWeChatAdapter(Platform):
             p for p in config.get("context_skip_prefixes", ["/"]) if p
         )
         self.resolve_member_names = bool(config.get("resolve_member_names", True))
+        self.send_images = bool(config.get("send_images", True))
+        self.mention_sender = bool(config.get("mention_sender", False))
+        self.strip_markdown = bool(config.get("strip_markdown", True))
+        # Plugins such as meme managers deliver images through send_by_session;
+        # allow that only shortly after a mention in the same allowed group.
+        self.proactive_window = max(
+            0, int(config.get("proactive_window_seconds", 120) or 0)
+        )
+        self.recent_mentions = {}
+        self.proactive_sent = 0
         self.member_names = {}
         self.member_refreshed = {}
         self.http = None
@@ -270,6 +360,10 @@ class NativeWeChatAdapter(Platform):
                         if message:
                             self.commit_event(NativeWeChatEvent(message, self))
                             if is_self_mention(message.raw_message):
+                                self.recent_mentions[message.group_id] = (
+                                    time.monotonic(),
+                                    message,
+                                )
                                 logger.info(
                                     "Native WeChat admitted one mentioned group message"
                                 )
@@ -293,7 +387,8 @@ class NativeWeChatAdapter(Platform):
         finally:
             await self.http.close()
 
-    async def reply(self, source, text, key):
+    async def ensure_reply_allowed(self, source):
+        """Re-read the source so recalled or ineligible messages get no reply."""
         if source.group_id not in self.allowed_groups:
             raise ValueError("Reply target is not approved")
         current = await self.request(
@@ -301,11 +396,48 @@ class NativeWeChatAdapter(Platform):
         )
         if not self.convert(current, "live", require_mention=True):
             raise ValueError("Original message is no longer eligible for a reply")
+
+    async def reply(self, source, text, key, mention=None):
+        await self.ensure_reply_allowed(source)
+        await self.send_text(source.group_id, text, key, mention)
+
+    def mention_for(self, source):
+        """Build a mention of the asker, or None when disabled or unsafe."""
+        if not self.mention_sender or not source.sender:
+            return None
+        user_id = source.sender.user_id
+        label = (source.sender.nickname or user_id or "").strip()
+        if (
+            not user_id
+            or not re.fullmatch(r"[A-Za-z0-9_@.-]{1,256}", user_id)
+            or not label
+            or len(label.encode()) > 1024
+            or re.search(r"[\u0000-\u001f\u007f-\u009f\u2005]", label)
+        ):
+            return None
+        return {"userId": user_id, "label": label}
+
+    async def send_text(self, group, text, key, mention=None):
+        if group not in self.allowed_groups:
+            raise ValueError("Reply target is not approved")
+        if self.strip_markdown:
+            text = clean_markdown(text)
+        if not text:
+            return
+        body = {"threadId": group, "text": text}
+        if mention:
+            prefix = f"@{mention['label']}{MENTION_SEPARATOR}"
+            body = {
+                "kind": "text",
+                "threadId": group,
+                "text": prefix + text,
+                "mentions": {
+                    "userIds": [mention["userId"]],
+                    "positions": [{"start": 0, "end": utf16_len(prefix), "index": 0}],
+                },
+            }
         intent = await self.request(
-            "POST",
-            "/sends",
-            headers={"Idempotency-Key": key},
-            json={"threadId": source.group_id, "text": text},
+            "POST", "/sends", headers={"Idempotency-Key": key}, json=body
         )
         deadline = time.monotonic() + 65
         while (
@@ -315,12 +447,58 @@ class NativeWeChatAdapter(Platform):
             intent = await self.request("GET", "/sends/" + quote(intent["id"], safe=""))
         if (
             intent.get("accountId", self.account_id) != self.account_id
-            or intent.get("destination", source.group_id) != source.group_id
+            or intent.get("destination", group) != group
         ):
             raise RuntimeError("WeChat send receipt identity mismatch")
         if intent["state"] not in ("accepted", "sent", "server_accepted"):
             raise RuntimeError(
                 "WeChat delivery is unconfirmed; do not automatically resend"
+            )
+
+    async def send_image(self, group, image, key):
+        """Upload one image to the bridge and send it to an allowed group."""
+        if group not in self.allowed_groups:
+            raise ValueError("Reply target is not approved")
+        path = Path(await image.convert_to_file_path())
+        data = path.read_bytes()
+        if not data or len(data) > IMAGE_MAX_BYTES:
+            raise ValueError("Image is empty or larger than the bridge limit")
+        mime, extension = image_mime(data)
+        if not mime:
+            raise ValueError("Unsupported image format")
+        form = aiohttp.FormData()
+        form.add_field("file", data, filename=f"image.{extension}", content_type=mime)
+        source = await self.request("POST", "/uploads", data=form)
+        job = await self.request(
+            "POST",
+            "/sends",
+            headers={"Idempotency-Key": key},
+            json={
+                "threadId": group,
+                "kind": "image",
+                "sourceId": source["id"],
+                "standardSourceId": None,
+                "thumbnailSourceId": None,
+                "playSeconds": None,
+                "durationMs": None,
+            },
+        )
+        deadline = time.monotonic() + 65
+        while (
+            job.get("state") not in MEDIA_TERMINAL_STATES
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(1)
+            job = await self.request("GET", "/jobs/" + quote(job["id"], safe=""))
+        if (
+            job.get("accountId", self.account_id) != self.account_id
+            or job.get("threadId", group) != group
+        ):
+            raise RuntimeError("WeChat media job identity mismatch")
+        if job.get("state") not in MEDIA_SUCCESS_STATES:
+            raise RuntimeError(
+                f"WeChat image delivery is unconfirmed ({job.get('state')}); "
+                "do not automatically resend"
             )
 
     async def member_name(self, group, username):
@@ -368,7 +546,38 @@ class NativeWeChatAdapter(Platform):
         return name
 
     async def send_by_session(self, session, message_chain):
-        raise ValueError("Proactive sending is disabled; reply to an admitted event")
+        """Deliver plugin follow-ups (e.g. memes) right after a mention only.
+
+        Arbitrary proactive messages stay disabled: the target must be an
+        allowed group whose latest explicit mention is within
+        proactive_window_seconds, and that message must still be eligible.
+        """
+        group = getattr(session, "session_id", None)
+        recent = self.recent_mentions.get(group)
+        if (
+            group not in self.allowed_groups
+            or getattr(session, "message_type", None) != MessageType.GROUP_MESSAGE
+            or not recent
+            or time.monotonic() - recent[0] > self.proactive_window
+        ):
+            raise ValueError(
+                "Proactive sending is limited to groups mentioned in the last "
+                f"{self.proactive_window} seconds"
+            )
+        source = recent[1]
+        segments = outgoing_segments(message_chain.chain, self.send_images)
+        if not segments:
+            return
+        await self.ensure_reply_allowed(source)
+        for kind, value in segments:
+            self.proactive_sent += 1
+            key = hashlib.sha256(
+                f"{source.message_id}:follow-up:{self.proactive_sent}".encode()
+            ).hexdigest()
+            if kind == "text":
+                await self.send_text(group, value, key)
+            else:
+                await self.send_image(group, value, key)
 
     async def terminate(self):
         if self.http and not self.http.closed:
@@ -376,7 +585,7 @@ class NativeWeChatAdapter(Platform):
 
 
 @register(
-    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.3.0"
+    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.4.0"
 )
 class NativeWeChatPlugin(Star):
     def __init__(self, context, config=None):
@@ -402,6 +611,15 @@ class NativeWeChatPlugin(Star):
         if self.watch_task:
             self.watch_task.cancel()
             self.watch_task = None
+
+    @event_filter.on_llm_request()
+    async def add_wechat_style_hint(self, event, req):
+        """Tell the model how WeChat renders replies (no Markdown, face codes)."""
+        if event.get_platform_name() != "native_wechat":
+            return
+        hint = self.config.get("reply_style_hint", DEFAULT_STYLE_HINT)
+        if isinstance(hint, str) and hint.strip():
+            req.system_prompt = f"{req.system_prompt or ''}\n\n{hint.strip()}".strip()
 
     async def configure_groups(self):
         manager = self.context.astrbot_config_mgr

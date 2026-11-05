@@ -14,5 +14,9 @@
   "context_skip_prefixes": [
     "/"
   ],
-  "resolve_member_names": true
+  "resolve_member_names": true,
+  "send_images": true,
+  "mention_sender": false,
+  "strip_markdown": true,
+  "proactive_window_seconds": 120
 }
