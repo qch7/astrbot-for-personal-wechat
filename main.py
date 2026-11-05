@@ -64,6 +64,18 @@ DEFAULT_STYLE_HINT = (
 )
 
 
+CRON_DELIVERED_EXTRA = "native_wechat_cron_delivered"
+# Status remarks models append to scheduled results, e.g. "（任务完成，提醒已送达。）".
+CRON_STATUS_NOTE = re.compile(
+    r"[（(][^（）()]*(?:任务完成|已送达|已发送|已提醒|提醒已|已完成)[^（）()]*[）)]"
+)
+
+
+def cron_result_text(text):
+    """The part of a scheduled task's final answer meant for the group."""
+    return CRON_STATUS_NOTE.sub("", text or "").strip()
+
+
 def is_self_mention(native):
     """Return whether a native message explicitly mentions the bot account."""
     mentions = (native or {}).get("mentions") or {}
@@ -924,12 +936,13 @@ class NativeWeChatAdapter(Platform):
         self.member_names[key] = (name, time.monotonic() + ttl)
         return name
 
-    def cron_payload(self, group):
-        """Payload of the scheduled task currently sending to `group`, if any.
+    def cron_event(self, group):
+        """The scheduled-task event currently sending to `group`, if any.
 
         AstrBot runs a cron job's agent inside event_context(CronMessageEvent),
         so the job (and the member who created it) is visible while its
-        send_message_to_user call reaches this adapter.
+        send_message_to_user call, or the plugin's fallback delivery, reaches
+        this adapter.
         """
         try:
             from astrbot.core.platform.astr_message_event import (
@@ -943,7 +956,11 @@ class NativeWeChatAdapter(Platform):
         payload = event.get_extra("cron_payload") or {}
         if payload.get("session") != f"{self.config['id']}:GroupMessage:{group}":
             return None
-        return payload
+        return event
+
+    def cron_payload(self, group):
+        event = self.cron_event(group)
+        return (event.get_extra("cron_payload") or {}) if event else None
 
     async def send_by_session(self, session, message_chain):
         """Deliver proactive messages to an allowed group.
@@ -996,6 +1013,8 @@ class NativeWeChatAdapter(Platform):
             else:
                 await self.send_image(group, value, key)
         if payload:
+            # Tells the plugin's fallback that this run has already delivered.
+            self.cron_event(group).set_extra(CRON_DELIVERED_EXTRA, True)
             logger.info("Native WeChat delivered a scheduled message to %s", group)
 
     async def terminate(self):
@@ -1004,7 +1023,7 @@ class NativeWeChatAdapter(Platform):
 
 
 @register(
-    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.6.0"
+    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.6.1"
 )
 class NativeWeChatPlugin(Star):
     def __init__(self, context, config=None):
@@ -1030,6 +1049,41 @@ class NativeWeChatPlugin(Star):
         if self.watch_task:
             self.watch_task.cancel()
             self.watch_task = None
+
+    @event_filter.on_llm_response()
+    async def deliver_cron_result(self, event, resp):
+        """Send a scheduled task's final answer when the model did not send it.
+
+        AstrBot only delivers cron output that the model sends with
+        send_message_to_user; models often just answer instead, and that
+        answer is otherwise lost. Runs inside the cron event context, so the
+        adapter still @-mentions the task's creator.
+        """
+        if event.get_platform_name() != "cron" or event.get_extra(CRON_DELIVERED_EXTRA):
+            return
+        payload = event.get_extra("cron_payload") or {}
+        session = str(payload.get("session") or "")
+        platform_id, sep, group = session.partition(":GroupMessage:")
+        if not sep or not group:
+            return
+        platforms = self.context.astrbot_config_mgr.default_conf.get("platform", [])
+        if not any(
+            p.get("id") == platform_id
+            and p.get("type") == "native_wechat"
+            and p.get("enable")
+            for p in platforms
+        ):
+            return
+        if resp is None or getattr(resp, "role", "assistant") != "assistant":
+            return
+        text = cron_result_text(getattr(resp, "completion_text", "") or "")
+        if not text:
+            return
+        try:
+            await self.context.send_message(session, MessageChain().message(text))
+            event.set_extra(CRON_DELIVERED_EXTRA, True)
+        except Exception as exc:  # e.g. proactive messages disabled
+            logger.error("Could not deliver scheduled WeChat message: %s", str(exc))
 
     @event_filter.on_llm_request()
     async def add_wechat_style_hint(self, event, req):
