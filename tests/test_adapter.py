@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import hashlib
 import json
 import tempfile
 import time
@@ -712,6 +713,40 @@ class IncomingMediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "/media/a1/content", self.adapter.request_bytes.await_args.args[0]
         )
+
+    async def test_request_bytes_reads_every_chunk(self):
+        chunks = [b"a" * 70000, b"b" * 70000, b"c" * 5]
+
+        class Content:
+            async def iter_chunked(self, size):
+                for chunk in chunks:
+                    yield chunk
+
+        class Response:
+            status = 200
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        self.adapter.http = SimpleNamespace(get=lambda url: Response())
+        data = await self.adapter.request_bytes("/media/a/content", 1 << 20)
+        self.assertEqual(data, b"".join(chunks))
+        with self.assertRaises(ValueError):
+            await self.adapter.request_bytes("/media/a/content", 100000)
+
+    async def test_incomplete_or_corrupt_media_is_rejected(self):
+        asset = {"id": "a1", "byteLength": len(PNG_1X1) + 10}
+        self.adapter.request_bytes = AsyncMock(return_value=PNG_1X1)
+        self.assertIsNone(await self.adapter.save_asset(asset, "image"))
+        asset = {"id": "a1", "byteLength": len(PNG_1X1), "sha256": "0" * 64}
+        self.assertIsNone(await self.adapter.save_asset(asset, "image"))
+        asset["sha256"] = hashlib.sha256(PNG_1X1).hexdigest()
+        path = await self.adapter.save_asset(asset, "image")
+        self.assertEqual(path.read_bytes(), PNG_1X1)
 
     async def test_download_falls_back_to_thumbnail_after_wait(self):
         page = {
