@@ -389,7 +389,9 @@ class OutgoingMediaTests(unittest.IsolatedAsyncioTestCase):
     def test_segments_and_markdown_cleanup(self):
         image = Image.fromFileSystem(str(self.png))
         segments = outgoing_segments([Plain("a"), Plain("b"), image, Plain(" ")])
-        self.assertEqual(segments, [("text", "ab"), ("image", image)])
+        self.assertEqual(
+            segments, [("text", [("plain", "a"), ("plain", "b")]), ("image", image)]
+        )
         self.assertEqual(outgoing_segments([image], images=False), [])
         self.assertEqual(
             clean_markdown("## 标题\n**重点** 和 __强调__\n```py\ncode\n```"),
@@ -527,7 +529,7 @@ class OutgoingMediaTests(unittest.IsolatedAsyncioTestCase):
         await event.send(MessageChain([Plain("给你"), image]))
         self.adapter.ensure_reply_allowed.assert_awaited_once()
         text_call = self.adapter.send_text.await_args
-        self.assertEqual(text_call.args[1], "给你")
+        self.assertEqual(text_call.args[1], [("plain", "给你")])
         self.assertEqual(text_call.args[3]["userId"], "wxid_person")
         self.adapter.send_image.assert_awaited_once()
         self.assertIs(self.adapter.send_image.await_args.args[1], image)
@@ -863,6 +865,143 @@ class IncomingMediaTests(unittest.IsolatedAsyncioTestCase):
         ask = self.adapter.convert(self.ask | {"id": "ask2"}, "live")
         await self.adapter.finish_and_commit(ask, "img1")
         self.assertEqual(self.adapter._event_queue.qsize(), 1)
+
+
+class ProactiveAndMentionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = {
+            "id": "wechat-test",
+            "type": "native_wechat",
+            "enable": True,
+            "server_url": "http://127.0.0.1:6174",
+            "account_id": "account-test",
+            "allowed_groups": ["123@chatroom"],
+            "state_file": str(Path(self.temp.name) / "state.json"),
+            "token_file": str(Path(self.temp.name) / "token"),
+            "chat_provider_id": "test-model",
+            "mention_sender": True,
+            "proactive_messages": True,
+        }
+        self.adapter = NativeWeChatAdapter(self.config, {}, asyncio.Queue())
+        self.adapter.own_id = "wxid_bot"
+        names = {"wxid_a": "小明", "wxid_b": "小红", "astrbot": "astrbot"}
+        self.adapter.member_name = AsyncMock(side_effect=lambda g, u: names.get(u, u))
+        self.session = SimpleNamespace(
+            session_id="123@chatroom", message_type=MessageType.GROUP_MESSAGE
+        )
+
+    def cron(self, payload):
+        from astrbot.core.platform.astr_message_event import current_message_event
+
+        event = SimpleNamespace(
+            get_platform_name=lambda: "cron",
+            get_extra=lambda key, default=None: (
+                payload if key == "cron_payload" else default
+            ),
+        )
+        token = current_message_event.set(event)
+        self.addCleanup(current_message_event.reset, token)
+
+    def test_at_components_become_tokens(self):
+        segments = outgoing_segments(
+            [Plain("提醒 "), At(qq="wxid_b"), Plain(" 喝水"), At(qq="all")]
+        )
+        self.assertEqual(
+            segments,
+            [("text", [("plain", "提醒 "), ("at", "wxid_b"), ("plain", " 喝水")])],
+        )
+        self.assertEqual(
+            outgoing_segments([At(qq="wxid_b")]), [("text", [("at", "wxid_b")])]
+        )
+
+    async def test_compose_text_positions_and_fallbacks(self):
+        body = await self.adapter.compose_text(
+            "123@chatroom",
+            [
+                ("plain", "  **早上好** "),
+                ("at", "wxid_a"),
+                ("plain", "和"),
+                ("at", "wxid_b"),
+                ("at", "wxid_a"),
+                ("plain", "  "),
+            ],
+        )
+        sep = "\u2005"
+        self.assertEqual(body["text"], f"早上好 @小明{sep}和@小红{sep}@小明{sep}")
+        self.assertEqual(body["mentions"]["userIds"], ["wxid_a", "wxid_b"])
+        self.assertEqual(
+            body["mentions"]["positions"],
+            [
+                {"start": 4, "end": 8, "index": 0},
+                {"start": 9, "end": 13, "index": 1},
+                {"start": 13, "end": 17, "index": 0},
+            ],
+        )
+        own = await self.adapter.compose_text(
+            "123@chatroom", [("at", "wxid_bot"), ("plain", "hi")]
+        )
+        self.assertEqual(own, {"threadId": "123@chatroom", "text": "@wxid_bot hi"})
+        self.assertIsNone(
+            await self.adapter.compose_text("123@chatroom", [("plain", " ")])
+        )
+
+    async def test_open_proactive_send_without_recent_mention(self):
+        self.adapter.ensure_reply_allowed = AsyncMock()
+        self.adapter.send_text = AsyncMock()
+        await self.adapter.send_by_session(self.session, MessageChain([Plain("公告")]))
+        self.adapter.send_text.assert_awaited_once()
+        self.assertIsNone(self.adapter.send_text.await_args.args[3])
+        self.adapter.ensure_reply_allowed.assert_not_awaited()
+        other = SimpleNamespace(
+            session_id="other@chatroom", message_type=MessageType.GROUP_MESSAGE
+        )
+        with self.assertRaises(ValueError):
+            await self.adapter.send_by_session(other, MessageChain([Plain("x")]))
+        private = SimpleNamespace(
+            session_id="123@chatroom", message_type=MessageType.FRIEND_MESSAGE
+        )
+        with self.assertRaises(ValueError):
+            await self.adapter.send_by_session(private, MessageChain([Plain("x")]))
+        self.assertTrue(self.adapter.meta().support_proactive_message)
+
+    async def test_scheduled_reminder_mentions_creator(self):
+        self.cron(
+            {"session": "wechat-test:GroupMessage:123@chatroom", "sender_id": "wxid_a"}
+        )
+        self.adapter.send_text = AsyncMock()
+        self.adapter.send_image = AsyncMock()
+        await self.adapter.send_by_session(
+            self.session, MessageChain([Plain("该喝水了"), Plain("！")])
+        )
+        call = self.adapter.send_text.await_args
+        self.assertEqual(call.args[3], {"userId": "wxid_a", "label": "小明"})
+
+    async def test_scheduled_reminder_respects_explicit_or_unknown_targets(self):
+        self.cron(
+            {"session": "wechat-test:GroupMessage:123@chatroom", "sender_id": "wxid_a"}
+        )
+        self.adapter.send_text = AsyncMock()
+        await self.adapter.send_by_session(
+            self.session, MessageChain([At(qq="wxid_b"), Plain("开会")])
+        )
+        self.assertIsNone(self.adapter.send_text.await_args.args[3])
+
+    async def test_webui_or_other_session_jobs_do_not_mention(self):
+        self.adapter.send_text = AsyncMock()
+        self.cron(
+            {"session": "wechat-test:GroupMessage:123@chatroom", "sender_id": "astrbot"}
+        )
+        await self.adapter.send_by_session(self.session, MessageChain([Plain("日报")]))
+        self.assertIsNone(self.adapter.send_text.await_args.args[3])
+        self.assertIsNone(self.adapter.cron_payload("other@chatroom"))
+
+    async def test_closed_proactive_keeps_follow_up_window(self):
+        self.adapter.proactive_messages = False
+        self.assertFalse(self.adapter.meta().support_proactive_message)
+        with self.assertRaises(ValueError):
+            await self.adapter.send_by_session(self.session, MessageChain([Plain("x")]))
 
 
 class ProfileAndAlertTests(unittest.IsolatedAsyncioTestCase):
