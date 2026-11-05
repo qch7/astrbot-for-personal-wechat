@@ -20,5 +20,7 @@
   "strip_markdown": true,
   "proactive_window_seconds": 120,
   "show_member_ids": true,
-  "text_mentions": false
+  "text_mentions": false,
+  "receive_media": true,
+  "attach_recent_image_seconds": 120
 }

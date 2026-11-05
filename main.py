@@ -2,7 +2,8 @@
 # Copyright (C) 2026 shuizhaodemumu
 # Modified 2026 by qch7 (fork): group context messages, member nicknames,
 # per-group whitelist/profile defaults, bot-offline alerts, image replies,
-# @-mentioning the asker and WeChat reply-style hints.
+# @-mentioning the asker, WeChat reply-style hints, incoming images/voice and
+# quote replies.
 
 import asyncio
 import copy
@@ -18,7 +19,7 @@ import aiohttp
 from astrbot.api import logger, sp
 from astrbot.api.event import MessageChain
 from astrbot.api.event import filter as event_filter
-from astrbot.api.message_components import At, Image, Plain
+from astrbot.api.message_components import At, Image, Plain, Record
 from astrbot.api.platform import (
     AstrBotMessage,
     AstrMessageEvent,
@@ -47,6 +48,13 @@ MEDIA_TERMINAL_STATES = MEDIA_SUCCESS_STATES | {
 }
 IMAGE_MAX_BYTES = 26214383  # bridge mediaSendMaxBytes.image
 MENTION_SEPARATOR = "\u2005"  # WeChat mention terminator (four-per-em space)
+QUOTE_APP_MESSAGE_TYPE = 57  # type 49 "reply with quote"
+MEDIA_MESSAGE_KINDS = {3: "image", 34: "voice", 47: "sticker"}
+MEDIA_PLACEHOLDERS = {"image": "[图片]", "voice": "[语音] ", "sticker": "[动画表情]"}
+MEDIA_VARIANTS = {"image": ("standard", "original", "thumbnail"), "voice": ("normal",)}
+MEDIA_PENDING_STATES = {"pending", "queued", "running", "downloading"}
+MEDIA_FILE_TTL = 3600
+VOICE_MAX_BYTES = 26214383
 DEFAULT_STYLE_HINT = (
     "你正在微信群里回复。微信不渲染 Markdown：不要用 **加粗**、# 标题、表格或代码块，"
     "用自然的短段落。可以适当使用微信自带表情代码，例如 [捂脸] [旺柴] [破涕为笑] "
@@ -168,6 +176,8 @@ class NativeWeChatEvent(AstrMessageEvent):
         "proactive_window_seconds": 120,
         "show_member_ids": True,
         "text_mentions": False,
+        "receive_media": True,
+        "attach_recent_image_seconds": 120,
     },
     adapter_display_name="本机个人微信",
     support_streaming_message=False,
@@ -206,6 +216,16 @@ class NativeWeChatAdapter(Platform):
         # Also treat a typed "@<bot group nickname>" as a mention (WeChat only
         # attaches mention metadata when the member is picked from the list).
         self.text_mentions = bool(config.get("text_mentions", False))
+        # Images and voice are forwarded as group context (they cannot carry
+        # an @); an @ message also gets the sender's recent or quoted image.
+        self.receive_media = bool(config.get("receive_media", True))
+        self.attach_window = max(
+            0, int(config.get("attach_recent_image_seconds", 120) or 0)
+        )
+        self.media_dir = self.state_file.parent / "media"
+        self.recent_images = {}
+        self.images_by_server_id = {}
+        self.tasks = set()
         self.member_names = {}
         self.member_refreshed = {}
         self.http = None
@@ -259,35 +279,52 @@ class NativeWeChatAdapter(Platform):
             return f"{name}({username})"
         return name or username
 
+    def message_kind(self, native):
+        """Classify a native message as text, image, voice or sticker (or None)."""
+        kind = native.get("type")
+        if kind == 1:
+            return "text"
+        if kind == 49 and native.get("appMessageType") == QUOTE_APP_MESSAGE_TYPE:
+            return "text"  # reply with a quote: its body is ordinary text
+        if self.receive_media:
+            return MEDIA_MESSAGE_KINDS.get(kind)
+        return None
+
     def convert(self, native, origin, require_mention=True):
-        """Admit only fresh text messages in approved groups.
+        """Admit only fresh messages in approved groups.
 
         Args:
             native: Canonical native message from the authenticated bridge.
             origin: Event origin supplied by the bridge.
-            require_mention: When False, unmentioned text is admitted as
-                context only (no At component, so AstrBot does not wake the
-                model), except text starting with a skipped command prefix.
+            require_mention: When False, unmentioned text and media are
+                admitted as context only (no At component, so AstrBot does not
+                wake the model), except text starting with a skipped command
+                prefix. Media cannot carry an @ and is never answered.
 
         Returns:
             An AstrBot message, or None when the message is outside the policy.
+            Media messages carry a text placeholder until attach_media().
         """
-        mentioned = self.is_mentioned(native)
+        kind = self.message_kind(native)
         if (
-            origin != "live"
+            kind is None
+            or origin != "live"
             or native.get("accountId") != self.account_id
             or native.get("threadId") not in self.allowed_groups
             or native.get("direction") != "incoming"
-            or native.get("type") != 1
             or not native.get("senderId")
             or native.get("senderId") == self.own_id
-            or not native.get("body")
+            or (kind == "text" and not native.get("body"))
             or native.get("recall")
         ):
             return None
+        mentioned = kind == "text" and self.is_mentioned(native)
         if not mentioned and (
             require_mention
-            or native["body"].lstrip().startswith(self.context_skip_prefixes)
+            or (
+                kind == "text"
+                and native["body"].lstrip().startswith(self.context_skip_prefixes)
+            )
         ):
             return None
         try:
@@ -306,12 +343,17 @@ class NativeWeChatAdapter(Platform):
         message.group_id = native["threadId"]
         message.message_id = native["id"]
         message.sender = MessageMember(native["senderId"], native["senderId"])
-        message.message_str = native["body"]
-        message.message = (
-            [At(qq=self.own_id), Plain(native["body"])]
-            if mentioned
-            else [Plain(native["body"])]
-        )
+        message.wechat_kind = kind
+        if kind == "text":
+            message.message_str = native["body"]
+            message.message = (
+                [At(qq=self.own_id), Plain(native["body"])]
+                if mentioned
+                else [Plain(native["body"])]
+            )
+        else:
+            message.message_str = MEDIA_PLACEHOLDERS[kind]
+            message.message = [Plain(MEDIA_PLACEHOLDERS[kind])]
         message.timestamp = int(created.timestamp())
         message.raw_message = native
         return message
@@ -362,6 +404,7 @@ class NativeWeChatAdapter(Platform):
                             ):
                                 raise RuntimeError("WeChat message identity mismatch")
                             if native["id"] not in self.seen:
+                                self.remember_image(native)
                                 if self.text_mentions and self.own_id:
                                     # Cache the bot's own nickname for typed @s.
                                     await self.member_name(
@@ -388,19 +431,13 @@ class NativeWeChatAdapter(Platform):
                         temporary.chmod(0o600)
                         temporary.replace(self.state_file)
                         if message:
-                            self.commit_event(NativeWeChatEvent(message, self))
-                            if self.is_mentioned(message.raw_message):
-                                self.recent_mentions[message.group_id] = (
-                                    time.monotonic(),
-                                    message,
-                                )
-                                logger.info(
-                                    "Native WeChat admitted one mentioned group message"
-                                )
+                            image_ref = self.referenced_image(message)
+                            if message.wechat_kind in ("image", "voice") or image_ref:
+                                # Downloads may wait for the bridge; never stall
+                                # the event loop for later messages.
+                                self.spawn(self.finish_and_commit(message, image_ref))
                             else:
-                                logger.debug(
-                                    "Native WeChat forwarded one group context message"
-                                )
+                                self.dispatch(message)
                     await asyncio.sleep(1 if len(page["items"]) < 100 else 0)
                 except asyncio.CancelledError:
                     raise
@@ -415,7 +452,178 @@ class NativeWeChatAdapter(Platform):
                     logger.error("Native WeChat receive failed: %s", str(exc))
                     await asyncio.sleep(5)
         finally:
+            for task in list(self.tasks):
+                task.cancel()
             await self.http.close()
+
+    def dispatch(self, message):
+        self.commit_event(NativeWeChatEvent(message, self))
+        if self.is_mentioned(message.raw_message):
+            self.recent_mentions[message.group_id] = (time.monotonic(), message)
+            logger.info("Native WeChat admitted one mentioned group message")
+        else:
+            logger.debug("Native WeChat forwarded one group context message")
+
+    def spawn(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
+
+    def remember_image(self, native):
+        """Track incoming images so a later @ or quote can show them to the model."""
+        if (
+            not self.receive_media
+            or native.get("type") != 3
+            or native.get("direction") != "incoming"
+            or native.get("threadId") not in self.allowed_groups
+        ):
+            return
+        now = time.monotonic()
+        key = (native["threadId"], native.get("senderId"))
+        self.recent_images[key] = (now, native["id"])
+        if native.get("serverId"):
+            self.images_by_server_id[str(native["serverId"])] = native["id"]
+            while len(self.images_by_server_id) > 500:
+                self.images_by_server_id.pop(next(iter(self.images_by_server_id)))
+
+    def referenced_image(self, message):
+        """Return the message ID of the image an @ message refers to, if any.
+
+        A quoted image wins; otherwise the sender's own latest image within
+        attach_recent_image_seconds (used once).
+        """
+        native = message.raw_message
+        if message.wechat_kind != "text" or not self.is_mentioned(native):
+            return None
+        quoted = native.get("quote") or {}
+        if quoted.get("type") == 3 and quoted.get("serverId"):
+            found = self.images_by_server_id.get(str(quoted["serverId"]))
+            if found:
+                return found
+        key = (native["threadId"], native["senderId"])
+        recent = self.recent_images.get(key)
+        if (
+            recent
+            and self.attach_window
+            and time.monotonic() - recent[0] <= self.attach_window
+        ):
+            self.recent_images.pop(key, None)
+            return recent[1]
+        return None
+
+    async def finish_and_commit(self, message, image_ref=None):
+        try:
+            if message.wechat_kind in ("image", "voice"):
+                await self.attach_media(message)
+            if image_ref:
+                path = await self.download_media(image_ref, "image")
+                if path:
+                    message.message.append(Image.fromFileSystem(str(path)))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # media is best effort; still deliver the text
+            logger.warning("Native WeChat media handling failed: %s", str(exc))
+        self.dispatch(message)
+
+    async def attach_media(self, message):
+        """Replace a media placeholder with the downloaded Image/Record."""
+        kind = message.wechat_kind
+        path = await self.download_media(message.message_id, kind)
+        if not path:
+            message.message = [Plain(MEDIA_PLACEHOLDERS[kind].strip() + "（未能获取）")]
+            return
+        if kind == "image":
+            message.message = [Image.fromFileSystem(str(path))]
+        else:
+            # AstrBot's speech-to-text replaces the Record with its transcript.
+            message.message = [
+                Plain(MEDIA_PLACEHOLDERS["voice"]),
+                Record.fromFileSystem(str(path)),
+            ]
+
+    async def download_media(self, message_id, kind, wait=15):
+        """Fetch the best available image/voice asset of a message to disk.
+
+        Waits up to `wait` seconds while the bridge is still downloading it.
+        Returns the file path, or None when no usable asset becomes available.
+        """
+        variants = MEDIA_VARIANTS[kind]
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                page = await self.request(
+                    "GET", "/messages/" + quote(message_id, safe="") + "/media"
+                )
+            except RuntimeError as exc:
+                logger.warning("WeChat media lookup failed: %s", str(exc))
+                return None
+            assets = {
+                a.get("variant"): a
+                for a in page.get("items") or []
+                if a.get("kind") == kind
+            }
+            rank = next(
+                (
+                    i
+                    for i, v in enumerate(variants)
+                    if (assets.get(v) or {}).get("state") == "available"
+                    and assets[v].get("id")
+                ),
+                len(variants),
+            )
+            # Wait for a better variant still downloading, then settle for
+            # the best one available (e.g. a thumbnail).
+            better_pending = any(
+                (assets.get(v) or {}).get("state") in MEDIA_PENDING_STATES
+                for v in variants[:rank]
+            )
+            if not better_pending or time.monotonic() >= deadline:
+                if rank < len(variants):
+                    return await self.save_asset(assets[variants[rank]], kind)
+                return None
+            await asyncio.sleep(1)
+
+    async def save_asset(self, asset, kind):
+        limit = IMAGE_MAX_BYTES if kind == "image" else VOICE_MAX_BYTES
+        data = await self.request_bytes(
+            "/media/" + quote(asset["id"], safe="") + "/content", limit
+        )
+        if kind == "image":
+            _, extension = image_mime(data)
+            if not extension:
+                logger.warning("WeChat image asset has an unknown format")
+                return None
+        else:
+            if data[:4] != b"RIFF":
+                logger.warning("WeChat voice asset is not WAV")
+                return None
+            extension = "wav"
+        self.media_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.prune_media()
+        digest = hashlib.sha256(data).hexdigest()[:24]
+        path = self.media_dir / f"{kind}-{digest}.{extension}"
+        path.write_bytes(data)
+        path.chmod(0o600)
+        return path
+
+    def prune_media(self):
+        cutoff = time.time() - MEDIA_FILE_TTL
+        for old in self.media_dir.glob("*"):
+            try:
+                if old.is_file() and old.stat().st_mtime < cutoff:
+                    old.unlink()
+            except OSError:
+                pass
+
+    async def request_bytes(self, path, limit):
+        async with self.http.get(self.base + self.prefix + path) as response:
+            if response.status >= 400:
+                raise RuntimeError(f"WeChat bridge HTTP {response.status}")
+            data = await response.content.read(limit + 1)
+        if not data or len(data) > limit:
+            raise ValueError("WeChat media is empty or too large")
+        return data
 
     async def ensure_reply_allowed(self, source):
         """Re-read the source so recalled or ineligible messages get no reply."""
@@ -442,19 +650,42 @@ class NativeWeChatAdapter(Platform):
         name = await self.member_name(group, sender)
         message.wechat_sender_name = name
         message.sender = MessageMember(sender, self.display_name(name, sender))
+        notes = []
         mentions = native.get("mentions") or {}
         others = [
             uid
             for uid in mentions.get("userIds") or []
             if isinstance(uid, str) and uid not in (self.own_id, sender)
         ]
-        if not others or not self.show_member_ids:
+        if others and self.show_member_ids:
+            labels = [
+                self.display_name(await self.member_name(group, uid), uid)
+                for uid in others[:20]
+            ]
+            notes.append("（这条消息@了：" + "、".join(labels) + "）")
+        quoted = native.get("quote") if native.get("type") == 49 else None
+        if isinstance(quoted, dict):
+            author = quoted.get("senderId")
+            if author == self.own_id:
+                who = "你（机器人）"
+            elif isinstance(author, str) and author:
+                who = self.display_name(await self.member_name(group, author), author)
+            else:
+                who = "某人"
+            text = quoted.get("embeddedText")
+            if quoted.get("type") == 3:
+                text = "[图片]"
+            elif quoted.get("type") == 34:
+                text = "[语音]"
+            elif not isinstance(text, str) or not text.strip():
+                text = "[消息]"
+            text = text.strip()
+            if len(text) > 120:
+                text = text[:120] + "…"
+            notes.append(f"（引用了 {who} 的消息：{text}）")
+        if not notes:
             return
-        labels = [
-            self.display_name(await self.member_name(group, uid), uid)
-            for uid in others[:20]
-        ]
-        note = "\n（这条消息@了：" + "、".join(labels) + "）"
+        note = "\n" + "\n".join(notes)
         message.message_str += note
         for part in message.message:
             if isinstance(part, Plain):
@@ -650,7 +881,7 @@ class NativeWeChatAdapter(Platform):
 
 
 @register(
-    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.4.1"
+    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.5.0"
 )
 class NativeWeChatPlugin(Star):
     def __init__(self, context, config=None):
