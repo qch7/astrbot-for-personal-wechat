@@ -2,8 +2,8 @@
 # Copyright (C) 2026 shuizhaodemumu
 # Modified 2026 by qch7 (fork): group context messages, member nicknames,
 # per-group whitelist/profile defaults, bot-offline alerts, image replies,
-# @-mentioning the asker, WeChat reply-style hints, incoming images/voice and
-# quote replies.
+# @-mentioning the asker, WeChat reply-style hints, incoming images/voice,
+# quote replies and private chats with friends.
 
 import asyncio
 import copy
@@ -55,13 +55,26 @@ MEDIA_VARIANTS = {"image": ("standard", "original", "thumbnail"), "voice": ("nor
 MEDIA_PENDING_STATES = {"pending", "queued", "running", "downloading"}
 MEDIA_FILE_TTL = 3600
 VOICE_MAX_BYTES = 26214383
-DEFAULT_STYLE_HINT = (
-    "你正在微信群里回复。微信不渲染 Markdown：不要用 **加粗**、# 标题、表格或代码块，"
+THREAD_KIND_TTL = 3600
+STYLE_HINT_BODY = (
+    "微信不渲染 Markdown：不要用 **加粗**、# 标题、表格或代码块，"
     "用自然的短段落。可以适当使用微信自带表情代码，例如 [捂脸] [旺柴] [破涕为笑] "
     "[抱拳] [机智] [裂开] [OK] [强] [爱心]，微信会把它们显示成表情；不要用 [微笑]，"
-    "它在中文网络里常被理解为嘲讽。群成员显示为「昵称(微信ID)」：昵称可以随意修改甚至"
+    "它在中文网络里常被理解为嘲讽。"
+)
+DEFAULT_STYLE_HINT = (
+    "你正在微信群里回复。"
+    + STYLE_HINT_BODY
+    + "群成员显示为「昵称(微信ID)」：昵称可以随意修改甚至"
     "和别人重名，判断谁是谁、某人@了谁时，以括号里的微信 ID 为准。"
 )
+DEFAULT_PRIVATE_STYLE_HINT = "你正在微信私聊里回复。" + STYLE_HINT_BODY
+
+
+class BridgeHTTPError(RuntimeError):
+    def __init__(self, status):
+        super().__init__(f"WeChat bridge HTTP {status}")
+        self.status = status
 
 
 CRON_DELIVERED_EXTRA = "native_wechat_cron_delivered"
@@ -145,12 +158,13 @@ class NativeWeChatEvent(AstrMessageEvent):
         segments = outgoing_segments(message.chain, self.platform.send_images)
         if not segments:
             return
-        if not self.platform.is_mentioned(self.message_obj.raw_message):
+        if not self.platform.is_directed(self.message_obj):
             # Context-only messages never get replies (e.g. proactive replies or
             # plugins reacting to every group message); drop instead of failing.
             logger.info("Native WeChat dropped a reply to an unmentioned message")
             return
         await self.platform.ensure_reply_allowed(self.message_obj)
+        thread = self.message_obj.session_id
         for kind, value in segments:
             key = hashlib.sha256(
                 f"{self.message_obj.message_id}:{self.delivery}".encode()
@@ -160,13 +174,13 @@ class NativeWeChatEvent(AstrMessageEvent):
             self.delivery += 1
             if kind == "text":
                 await self.platform.send_text(
-                    self.message_obj.group_id,
+                    thread,
                     value,
                     key,
                     self.platform.mention_for(self.message_obj) if mention else None,
                 )
             else:
-                await self.platform.send_image(self.message_obj.group_id, value, key)
+                await self.platform.send_image(thread, value, key)
         await super().send(message)
 
     async def send_streaming(self, generator, use_fallback=False):
@@ -201,6 +215,8 @@ class NativeWeChatEvent(AstrMessageEvent):
         "text_mentions": False,
         "receive_media": True,
         "attach_recent_image_seconds": 120,
+        "friend_whitelist": False,
+        "allowed_friends": [],
     },
     adapter_display_name="本机个人微信",
     support_streaming_message=False,
@@ -248,6 +264,20 @@ class NativeWeChatAdapter(Platform):
         self.attach_window = max(
             0, int(config.get("attach_recent_image_seconds", 120) or 0)
         )
+        # Private chats: every friend may talk to the bot, unless the friend
+        # whitelist is enabled; then only allowed_friends (empty = nobody).
+        # Only threads the bridge reports as "direct" count as private chats,
+        # so system and official accounts never reach the model.
+        self.friend_whitelist = bool(config.get("friend_whitelist", False))
+        self.allowed_friends = {
+            str(friend).strip()
+            for friend in config.get("allowed_friends") or []
+            if str(friend).strip()
+        }
+        if any(friend.endswith("@chatroom") for friend in self.allowed_friends):
+            raise ValueError("allowed_friends takes WeChat IDs, not group IDs")
+        self.thread_kinds = {}
+        self.contact_names = {}
         self.media_dir = self.state_file.parent / "media"
         self.recent_images = {}
         self.images_by_server_id = {}
@@ -282,8 +312,57 @@ class NativeWeChatAdapter(Platform):
             method, self.base + self.prefix + path, **kwargs
         ) as response:
             if response.status >= 400:
-                raise RuntimeError(f"WeChat bridge HTTP {response.status}")
+                raise BridgeHTTPError(response.status)
             return await response.json()
+
+    def friend_permitted(self, thread):
+        """Whether the friend policy admits a private thread ID (kind unchecked)."""
+        return (
+            isinstance(thread, str)
+            and bool(thread)
+            and not thread.endswith("@chatroom")
+            and thread != self.own_id
+            and (not self.friend_whitelist or thread in self.allowed_friends)
+        )
+
+    def is_private_thread(self, thread):
+        """A permitted friend whose chat was recently verified as direct."""
+        if not self.friend_permitted(thread):
+            return False
+        cached = self.thread_kinds.get(thread)
+        return bool(cached) and cached[0] == "direct" and cached[1] > time.monotonic()
+
+    def thread_permitted(self, thread):
+        """Approved group or verified private chat (uses cached lookups only)."""
+        return thread in self.allowed_groups or self.is_private_thread(thread)
+
+    async def thread_allowed(self, thread):
+        """Like thread_permitted(), looking up the chat kind when needed.
+
+        Transient bridge failures propagate (the poll loop retries); a chat
+        the bridge does not know is remembered as not private.
+        """
+        if thread in self.allowed_groups:
+            return True
+        if not self.friend_permitted(thread):
+            return False
+        cached = self.thread_kinds.get(thread)
+        if not cached or cached[1] <= time.monotonic():
+            try:
+                info = await self.request("GET", "/threads/" + quote(thread, safe=""))
+                kind = info.get("kind") if info.get("id") == thread else None
+            except BridgeHTTPError as exc:
+                if exc.status != 404:
+                    raise
+                kind = None
+            self.thread_kinds[thread] = (kind, time.monotonic() + THREAD_KIND_TTL)
+        return self.is_private_thread(thread)
+
+    def is_directed(self, source):
+        """Whether a message may be answered: private chats, or a group @."""
+        return source.type == MessageType.FRIEND_MESSAGE or self.is_mentioned(
+            source.raw_message
+        )
 
     def cached_name(self, group, username):
         cached = self.member_names.get((group, username))
@@ -318,35 +397,40 @@ class NativeWeChatAdapter(Platform):
         return None
 
     def convert(self, native, origin, require_mention=True):
-        """Admit only fresh messages in approved groups.
+        """Admit only fresh messages in approved groups or private chats.
 
         Args:
             native: Canonical native message from the authenticated bridge.
             origin: Event origin supplied by the bridge.
-            require_mention: When False, unmentioned text and media are
+            require_mention: When False, unmentioned group text and media are
                 admitted as context only (no At component, so AstrBot does not
                 wake the model), except text starting with a skipped command
-                prefix. Media cannot carry an @ and is never answered.
+                prefix. Group media cannot carry an @ and is never answered.
+                Private chats need no mention: every message is answered.
 
         Returns:
             An AstrBot message, or None when the message is outside the policy.
             Media messages carry a text placeholder until attach_media().
+            Private chats are admitted only after thread_allowed() verified them.
         """
         kind = self.message_kind(native)
+        thread = native.get("threadId")
+        private = thread not in self.allowed_groups and self.is_private_thread(thread)
         if (
             kind is None
             or origin != "live"
             or native.get("accountId") != self.account_id
-            or native.get("threadId") not in self.allowed_groups
+            or not (thread in self.allowed_groups or private)
             or native.get("direction") != "incoming"
             or not native.get("senderId")
             or native.get("senderId") == self.own_id
+            or (private and native.get("senderId") != thread)
             or (kind == "text" and not native.get("body"))
             or native.get("recall")
         ):
             return None
-        mentioned = kind == "text" and self.is_mentioned(native)
-        if not mentioned and (
+        mentioned = kind == "text" and not private and self.is_mentioned(native)
+        if not (mentioned or private) and (
             require_mention
             or (
                 kind == "text"
@@ -364,10 +448,12 @@ class NativeWeChatAdapter(Platform):
         except (KeyError, TypeError, ValueError):
             return None
         message = AstrBotMessage()
-        message.type = MessageType.GROUP_MESSAGE
+        message.type = (
+            MessageType.FRIEND_MESSAGE if private else MessageType.GROUP_MESSAGE
+        )
         message.self_id = self.own_id
-        message.session_id = native["threadId"]
-        message.group_id = native["threadId"]
+        message.session_id = thread
+        message.group_id = "" if private else thread
         message.message_id = native["id"]
         message.sender = MessageMember(native["senderId"], native["senderId"])
         message.wechat_kind = kind
@@ -418,9 +504,16 @@ class NativeWeChatAdapter(Platform):
                     for event in page["items"]:
                         message = None
                         data = event.get("data", {})
-                        if (
-                            event["kind"] == "message.committed"
-                            and data.get("threadId") in self.allowed_groups
+                        thread = data.get("threadId")
+                        if event["kind"] == "message.committed" and (
+                            thread in self.allowed_groups
+                            or (
+                                # Only fresh incoming private messages cost a
+                                # chat-kind lookup.
+                                data.get("origin") == "live"
+                                and data.get("direction") != "outgoing"
+                                and await self.thread_allowed(thread)
+                            )
                         ):
                             native = await self.request(
                                 "GET", "/messages/" + quote(data["messageId"], safe="")
@@ -432,7 +525,11 @@ class NativeWeChatAdapter(Platform):
                                 raise RuntimeError("WeChat message identity mismatch")
                             if native["id"] not in self.seen:
                                 self.remember_image(native)
-                                if self.text_mentions and self.own_id:
+                                if (
+                                    self.text_mentions
+                                    and self.own_id
+                                    and thread in self.allowed_groups
+                                ):
                                     # Cache the bot's own nickname for typed @s.
                                     await self.member_name(
                                         native["threadId"], self.own_id
@@ -485,8 +582,11 @@ class NativeWeChatAdapter(Platform):
 
     def dispatch(self, message):
         self.commit_event(NativeWeChatEvent(message, self))
-        if self.is_mentioned(message.raw_message):
-            self.recent_mentions[message.group_id] = (time.monotonic(), message)
+        if message.type == MessageType.FRIEND_MESSAGE:
+            self.recent_mentions[message.session_id] = (time.monotonic(), message)
+            logger.info("Native WeChat admitted one private message")
+        elif self.is_mentioned(message.raw_message):
+            self.recent_mentions[message.session_id] = (time.monotonic(), message)
             logger.info("Native WeChat admitted one mentioned group message")
         else:
             logger.debug("Native WeChat forwarded one group context message")
@@ -498,17 +598,21 @@ class NativeWeChatAdapter(Platform):
         return task
 
     def remember_image(self, native):
-        """Track incoming images so a later @ or quote can show them to the model."""
+        """Track incoming images so a later @ or quote can show them to the model.
+
+        Private images are answered on their own, so they are only kept for
+        quotes, not attached to the friend's next message.
+        """
         if (
             not self.receive_media
             or native.get("type") != 3
             or native.get("direction") != "incoming"
-            or native.get("threadId") not in self.allowed_groups
+            or not self.thread_permitted(native.get("threadId"))
         ):
             return
-        now = time.monotonic()
-        key = (native["threadId"], native.get("senderId"))
-        self.recent_images[key] = (now, native["id"])
+        if native["threadId"] in self.allowed_groups:
+            key = (native["threadId"], native.get("senderId"))
+            self.recent_images[key] = (time.monotonic(), native["id"])
         if native.get("serverId"):
             self.images_by_server_id[str(native["serverId"])] = native["id"]
             while len(self.images_by_server_id) > 500:
@@ -521,7 +625,7 @@ class NativeWeChatAdapter(Platform):
         attach_recent_image_seconds (used once).
         """
         native = message.raw_message
-        if message.wechat_kind != "text" or not self.is_mentioned(native):
+        if message.wechat_kind != "text" or not self.is_directed(message):
             return None
         quoted = native.get("quote") or {}
         if quoted.get("type") == 3 and quoted.get("serverId"):
@@ -657,7 +761,7 @@ class NativeWeChatAdapter(Platform):
         """Read a whole response body (a single read() may return only part)."""
         async with self.http.get(self.base + self.prefix + path) as response:
             if response.status >= 400:
-                raise RuntimeError(f"WeChat bridge HTTP {response.status}")
+                raise BridgeHTTPError(response.status)
             chunks, size = [], 0
             async for chunk in response.content.iter_chunked(65536):
                 size += len(chunk)
@@ -670,7 +774,7 @@ class NativeWeChatAdapter(Platform):
 
     async def ensure_reply_allowed(self, source):
         """Re-read the source so recalled or ineligible messages get no reply."""
-        if source.group_id not in self.allowed_groups:
+        if not await self.thread_allowed(source.session_id):
             raise ValueError("Reply target is not approved")
         current = await self.request(
             "GET", "/messages/" + quote(source.message_id, safe="")
@@ -680,7 +784,13 @@ class NativeWeChatAdapter(Platform):
 
     async def reply(self, source, text, key, mention=None):
         await self.ensure_reply_allowed(source)
-        await self.send_text(source.group_id, text, key, mention)
+        await self.send_text(source.session_id, text, key, mention)
+
+    async def person_name(self, thread, username):
+        """Group nickname in groups, contact name in private chats."""
+        if thread in self.allowed_groups:
+            return await self.member_name(thread, username)
+        return await self.contact_name(username)
 
     async def describe_people(self, message, native):
         """Name the sender and mentioned members as nickname(WeChat ID).
@@ -690,7 +800,7 @@ class NativeWeChatAdapter(Platform):
         impersonate each other.
         """
         group, sender = native["threadId"], native["senderId"]
-        name = await self.member_name(group, sender)
+        name = await self.person_name(group, sender)
         message.wechat_sender_name = name
         message.sender = MessageMember(sender, self.display_name(name, sender))
         notes = []
@@ -712,7 +822,7 @@ class NativeWeChatAdapter(Platform):
             if author == self.own_id:
                 who = "你（机器人）"
             elif isinstance(author, str) and author:
-                who = self.display_name(await self.member_name(group, author), author)
+                who = self.display_name(await self.person_name(group, author), author)
             else:
                 who = "某人"
             text = quoted.get("embeddedText")
@@ -736,8 +846,12 @@ class NativeWeChatAdapter(Platform):
                 break
 
     def mention_for(self, source):
-        """Build a mention of the asker, or None when disabled or unsafe."""
-        if not self.mention_sender or not source.sender:
+        """Build a mention of the asker, or None when disabled, private or unsafe."""
+        if (
+            not self.mention_sender
+            or not source.sender
+            or source.type == MessageType.FRIEND_MESSAGE
+        ):
             return None
         user_id = source.sender.user_id
         label = (
@@ -815,10 +929,17 @@ class NativeWeChatAdapter(Platform):
         }
 
     async def send_text(self, group, text, key, mention=None):
-        """Send text (a str or token list); `mention` @s that user first."""
-        if group not in self.allowed_groups:
+        """Send text (a str or token list); `mention` @s that user first.
+
+        `group` is the thread: an allowed group or a verified private chat,
+        where @-mentions do not exist and are dropped.
+        """
+        if not self.thread_permitted(group):
             raise ValueError("Reply target is not approved")
         tokens = [("plain", text)] if isinstance(text, str) else list(text)
+        if group not in self.allowed_groups:
+            tokens = [token for token in tokens if token[0] == "plain"]
+            mention = None
         labels = {}
         if mention:
             labels[mention["userId"]] = mention["label"]
@@ -847,8 +968,8 @@ class NativeWeChatAdapter(Platform):
             )
 
     async def send_image(self, group, image, key):
-        """Upload one image to the bridge and send it to an allowed group."""
-        if group not in self.allowed_groups:
+        """Upload one image to the bridge and send it to an allowed thread."""
+        if not self.thread_permitted(group):
             raise ValueError("Reply target is not approved")
         path = Path(await image.convert_to_file_path())
         data = path.read_bytes()
@@ -936,8 +1057,30 @@ class NativeWeChatAdapter(Platform):
         self.member_names[key] = (name, time.monotonic() + ttl)
         return name
 
-    def cron_event(self, group):
-        """The scheduled-task event currently sending to `group`, if any.
+    async def contact_name(self, username):
+        """Resolve a friend's display name, falling back to the WeChat ID."""
+        if not self.resolve_member_names:
+            return username
+        cached = self.contact_names.get(username)
+        if cached and cached[1] > time.monotonic():
+            return cached[0]
+        name = None
+        try:
+            contact = await self.request("GET", "/contacts/" + quote(username, safe=""))
+            for field in ("displayName", "remark", "nickname"):
+                value = contact.get(field)
+                if isinstance(value, str) and value.strip():
+                    name = value.strip()
+                    break
+        except (aiohttp.ClientError, TimeoutError, RuntimeError, ValueError) as exc:
+            logger.warning("Could not resolve WeChat contact name: %s", str(exc))
+        ttl = MEMBER_NAME_TTL if name else 60
+        name = name or username
+        self.contact_names[username] = (name, time.monotonic() + ttl)
+        return name
+
+    def cron_event(self, thread, message_type=MessageType.GROUP_MESSAGE):
+        """The scheduled-task event currently sending to `thread`, if any.
 
         AstrBot runs a cron job's agent inside event_context(CronMessageEvent),
         so the job (and the member who created it) is visible while its
@@ -954,28 +1097,38 @@ class NativeWeChatAdapter(Platform):
         if event is None or event.get_platform_name() != "cron":
             return None
         payload = event.get_extra("cron_payload") or {}
-        if payload.get("session") != f"{self.config['id']}:GroupMessage:{group}":
+        session = f"{self.config['id']}:{message_type.value}:{thread}"
+        if payload.get("session") != session:
             return None
         return event
 
-    def cron_payload(self, group):
-        event = self.cron_event(group)
+    def cron_payload(self, thread, message_type=MessageType.GROUP_MESSAGE):
+        event = self.cron_event(thread, message_type)
         return (event.get_extra("cron_payload") or {}) if event else None
 
     async def send_by_session(self, session, message_chain):
-        """Deliver proactive messages to an allowed group.
+        """Deliver proactive messages to an allowed group or private chat.
 
         With proactive_messages enabled, anything may be sent to an allowed
-        group (scheduled reminders, plugins, send_message_to_user). Otherwise
+        thread (scheduled reminders, plugins, send_message_to_user). Otherwise
         only follow-ups (e.g. memes) within proactive_window_seconds of a
-        mention are allowed. Scheduled reminders @-mention their creator.
+        mention or private message are allowed. Scheduled reminders in groups
+        @-mention their creator.
         """
         group = getattr(session, "session_id", None)
-        if (
-            group not in self.allowed_groups
-            or getattr(session, "message_type", None) != MessageType.GROUP_MESSAGE
-        ):
-            raise ValueError("Proactive sending is limited to allowed WeChat groups")
+        message_type = getattr(session, "message_type", None)
+        if message_type == MessageType.GROUP_MESSAGE:
+            allowed = group in self.allowed_groups
+        elif message_type == MessageType.FRIEND_MESSAGE:
+            allowed = group not in self.allowed_groups and await self.thread_allowed(
+                group
+            )
+        else:
+            allowed = False
+        if not allowed:
+            raise ValueError(
+                "Proactive sending is limited to allowed WeChat groups and friends"
+            )
         recent = self.recent_mentions.get(group)
         in_window = bool(
             recent and time.monotonic() - recent[0] <= self.proactive_window
@@ -991,11 +1144,16 @@ class NativeWeChatAdapter(Platform):
         if not self.proactive_messages:
             await self.ensure_reply_allowed(recent[1])
         mention = None
-        payload = self.cron_payload(group)
+        payload = self.cron_payload(group, message_type)
         explicit = any(
             k == "at" for kind, value in segments if kind == "text" for k, _ in value
         )
-        if payload and self.mention_sender and not explicit:
+        if (
+            payload
+            and self.mention_sender
+            and not explicit
+            and message_type == MessageType.GROUP_MESSAGE
+        ):
             creator = str(payload.get("sender_id") or "")
             name = await self.member_name(group, creator) if creator else None
             # Only @ a creator the group knows (not e.g. WebUI-created jobs).
@@ -1014,7 +1172,7 @@ class NativeWeChatAdapter(Platform):
                 await self.send_image(group, value, key)
         if payload:
             # Tells the plugin's fallback that this run has already delivered.
-            self.cron_event(group).set_extra(CRON_DELIVERED_EXTRA, True)
+            self.cron_event(group, message_type).set_extra(CRON_DELIVERED_EXTRA, True)
             logger.info("Native WeChat delivered a scheduled message to %s", group)
 
     async def terminate(self):
@@ -1023,7 +1181,7 @@ class NativeWeChatAdapter(Platform):
 
 
 @register(
-    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.6.1"
+    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.7.0"
 )
 class NativeWeChatPlugin(Star):
     def __init__(self, context, config=None):
@@ -1063,9 +1221,14 @@ class NativeWeChatPlugin(Star):
             return
         payload = event.get_extra("cron_payload") or {}
         session = str(payload.get("session") or "")
-        platform_id, sep, group = session.partition(":GroupMessage:")
-        if not sep or not group:
+        parts = session.split(":", 2)
+        if (
+            len(parts) != 3
+            or parts[1] not in ("GroupMessage", "FriendMessage")
+            or not parts[2]
+        ):
             return
+        platform_id = parts[0]
         platforms = self.context.astrbot_config_mgr.default_conf.get("platform", [])
         if not any(
             p.get("id") == platform_id
@@ -1090,7 +1253,12 @@ class NativeWeChatPlugin(Star):
         """Tell the model how WeChat renders replies (no Markdown, face codes)."""
         if event.get_platform_name() != "native_wechat":
             return
-        hint = self.config.get("reply_style_hint", DEFAULT_STYLE_HINT)
+        if event.is_private_chat():
+            hint = self.config.get(
+                "private_reply_style_hint", DEFAULT_PRIVATE_STYLE_HINT
+            )
+        else:
+            hint = self.config.get("reply_style_hint", DEFAULT_STYLE_HINT)
         if isinstance(hint, str) and hint.strip():
             req.system_prompt = f"{req.system_prompt or ''}\n\n{hint.strip()}".strip()
 
@@ -1107,6 +1275,7 @@ class NativeWeChatPlugin(Star):
         for platform in manager.default_conf.get("platform", []):
             if platform.get("type") != "native_wechat" or not platform.get("enable"):
                 continue
+            await self.configure_private_chats(platform)
             for group in platform.get("allowed_groups", []):
                 origin = f"{platform['id']}:GroupMessage:{group}"
                 profile_id = manager.get_conf_info(origin)["id"]
@@ -1164,6 +1333,51 @@ class NativeWeChatPlugin(Star):
                 await self.apply_group_persona(origin, profile, rule)
         if rules != original_rules and hasattr(self.config, "save_config"):
             self.config.save_config()
+
+    async def configure_private_chats(self, platform):
+        """Route the platform's private chats to one isolated profile.
+
+        The profile is created once from whatever applied to them before (a
+        copy, so other channels keep their settings) and routed with
+        "<platform>:FriendMessage:*". Its AstrBot ID whitelist is switched off
+        on creation: inherited entries would silently drop every friend, and
+        the adapter already enforces friend_whitelist/allowed_friends itself.
+        Nothing happens when the friend whitelist is on and empty.
+        """
+        if platform.get("friend_whitelist") and not any(
+            str(friend).strip() for friend in platform.get("allowed_friends") or []
+        ):
+            return None
+        manager = self.context.astrbot_config_mgr
+        pattern = f"{platform['id']}:FriendMessage:*"
+        routes = manager.ucr.umop_to_conf_id
+        profile_id = routes.get(pattern)
+        if (
+            not profile_id
+            or profile_id == "default"
+            or profile_id not in manager.confs
+            or any(k != pattern and v == profile_id for k, v in routes.items())
+        ):
+            profile = copy.deepcopy(dict(manager.get_conf(pattern)))
+            settings = profile["provider_settings"]
+            settings["wake_prefix"] = ""
+            settings["streaming_response"] = False
+            # Friends share long-term memory with other channels; say who it is.
+            settings["identifier"] = True
+            model = profile["agent_runner"]["config"]["model"]
+            model["provider_id"] = platform["chat_provider_id"]
+            model["fallback_provider_ids"] = []
+            profile.setdefault("platform_settings", {})["enable_id_white_list"] = False
+            profile_id = await manager.create_conf(profile, name="微信 · 私聊")
+            Path(manager.confs[profile_id].config_path).chmod(0o600)
+            await manager.ucr.update_routing_data(
+                {
+                    pattern: profile_id,
+                    **{k: v for k, v in routes.items() if k != pattern},
+                }
+            )
+            logger.info("Routed WeChat private chats (%s) to %s", pattern, profile_id)
+        return profile_id
 
     async def fetch_group_name(self, platform, group):
         """Read a group label without changing membership or sending messages.

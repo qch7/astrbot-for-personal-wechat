@@ -23,5 +23,7 @@
   "text_mentions": false,
   "receive_media": true,
   "attach_recent_image_seconds": 120,
-  "proactive_messages": false
+  "proactive_messages": false,
+  "friend_whitelist": false,
+  "allowed_friends": []
 }

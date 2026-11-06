@@ -16,7 +16,9 @@ from astrbot.api.platform import MessageType
 
 from main import (
     CRON_DELIVERED_EXTRA,
+    DEFAULT_PRIVATE_STYLE_HINT,
     DEFAULT_STYLE_HINT,
+    BridgeHTTPError,
     NativeWeChatAdapter,
     NativeWeChatEvent,
     NativeWeChatPlugin,
@@ -586,7 +588,9 @@ class OutgoingMediaTests(unittest.IsolatedAsyncioTestCase):
     async def test_style_hint_only_for_wechat_requests(self):
         plugin = NativeWeChatPlugin(SimpleNamespace(), {})
         req = SimpleNamespace(system_prompt="人设")
-        wechat = SimpleNamespace(get_platform_name=lambda: "native_wechat")
+        wechat = SimpleNamespace(
+            get_platform_name=lambda: "native_wechat", is_private_chat=lambda: False
+        )
         await plugin.add_wechat_style_hint(wechat, req)
         self.assertEqual(req.system_prompt, "人设\n\n" + DEFAULT_STYLE_HINT)
         other = SimpleNamespace(system_prompt="人设")
@@ -1291,6 +1295,7 @@ class PersonaTests(unittest.IsolatedAsyncioTestCase):
                         "type": "native_wechat",
                         "enable": True,
                         "allowed_groups": ["1@chatroom"],
+                        "friend_whitelist": True,
                     }
                 ]
             },
@@ -1347,6 +1352,7 @@ class PersonaTests(unittest.IsolatedAsyncioTestCase):
                             "enable": True,
                             "allowed_groups": ["1@chatroom"],
                             "chat_provider_id": "model",
+                            "friend_whitelist": True,
                         }
                     ]
                 },
@@ -1375,6 +1381,324 @@ class PersonaTests(unittest.IsolatedAsyncioTestCase):
             {"server_url": "https://example.com"}, "1@chatroom"
         )
         self.assertIsNone(result)
+
+
+class PrivateChatTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = {
+            "id": "wechat-test",
+            "type": "native_wechat",
+            "enable": True,
+            "server_url": "http://127.0.0.1:6174",
+            "account_id": "account-test",
+            "allowed_groups": ["123@chatroom"],
+            "state_file": str(Path(self.temp.name) / "state.json"),
+            "token_file": str(Path(self.temp.name) / "token"),
+            "chat_provider_id": "test-model",
+            "mention_sender": True,
+            "proactive_messages": True,
+        }
+        Path(self.config["token_file"]).write_text("test")
+        self.adapter = self.make_adapter()
+        self.native = {
+            "id": "dm1",
+            "accountId": "account-test",
+            "threadId": "wxid_friend",
+            "senderId": "wxid_friend",
+            "type": 1,
+            "direction": "incoming",
+            "body": "你好",
+            "mentions": {"state": "known", "self": False, "all": False},
+            "createdAt": datetime.now(UTC).isoformat(),
+        }
+
+    def make_adapter(self, **changes):
+        adapter = NativeWeChatAdapter(self.config | changes, {}, asyncio.Queue())
+        adapter.own_id = "wxid_bot"
+        return adapter
+
+    def verify(self, thread="wxid_friend", kind="direct"):
+        self.adapter.thread_kinds[thread] = (kind, time.monotonic() + 3600)
+
+    async def test_private_chat_needs_a_verified_direct_thread(self):
+        self.assertIsNone(self.adapter.convert(self.native, "live"))
+        self.adapter.request = AsyncMock(
+            return_value={"id": "wxid_friend", "kind": "direct"}
+        )
+        self.assertTrue(await self.adapter.thread_allowed("wxid_friend"))
+        self.assertTrue(await self.adapter.thread_allowed("wxid_friend"))
+        self.adapter.request.assert_awaited_once()
+        message = self.adapter.convert(self.native, "live")
+        self.assertEqual(message.type, MessageType.FRIEND_MESSAGE)
+        self.assertEqual((message.session_id, message.group_id), ("wxid_friend", ""))
+        self.assertEqual([type(p) for p in message.message], [Plain])
+        event = NativeWeChatEvent(message, self.adapter)
+        self.assertEqual(
+            event.unified_msg_origin, "wechat-test:FriendMessage:wxid_friend"
+        )
+        self.assertTrue(event.is_private_chat())
+        variants = [
+            {"senderId": "wxid_other"},
+            {"direction": "outgoing"},
+            {"accountId": "another-account"},
+            {"createdAt": (datetime.now(UTC) - timedelta(hours=1)).isoformat()},
+        ]
+        for change in variants:
+            with self.subTest(change=change):
+                self.assertIsNone(self.adapter.convert(self.native | change, "live"))
+        self.assertIsNone(self.adapter.convert(self.native, "history"))
+        # Media and stickers are answered on their own in private chats.
+        sticker = self.native | {"type": 47, "body": ""}
+        self.assertEqual(
+            self.adapter.convert(sticker, "live").message_str, "[动画表情]"
+        )
+
+    async def test_system_unknown_and_failing_lookups(self):
+        self.adapter.request = AsyncMock(
+            return_value={"id": "weixin", "kind": "system"}
+        )
+        self.assertFalse(await self.adapter.thread_allowed("weixin"))
+        self.adapter.request = AsyncMock(side_effect=BridgeHTTPError(404))
+        self.assertFalse(await self.adapter.thread_allowed("wxid_gone"))
+        self.assertFalse(await self.adapter.thread_allowed("wxid_gone"))
+        self.adapter.request.assert_awaited_once()
+        self.adapter.request = AsyncMock(side_effect=BridgeHTTPError(500))
+        with self.assertRaises(BridgeHTTPError):
+            await self.adapter.thread_allowed("wxid_new")
+        self.assertNotIn("wxid_new", self.adapter.thread_kinds)
+        self.adapter.request = AsyncMock()
+        for thread in ("other@chatroom", "wxid_bot", "", None):
+            self.assertFalse(await self.adapter.thread_allowed(thread))
+        self.adapter.request.assert_not_awaited()
+
+    async def test_friend_whitelist(self):
+        self.adapter = self.make_adapter(
+            friend_whitelist=True, allowed_friends=[" wxid_friend ", ""]
+        )
+        self.adapter.request = AsyncMock(
+            return_value={"id": "wxid_friend", "kind": "direct"}
+        )
+        self.assertTrue(await self.adapter.thread_allowed("wxid_friend"))
+        self.assertFalse(await self.adapter.thread_allowed("wxid_other"))
+        self.adapter.request.assert_awaited_once()
+        closed = self.make_adapter(friend_whitelist=True, allowed_friends=[])
+        closed.request = AsyncMock()
+        self.assertFalse(await closed.thread_allowed("wxid_friend"))
+        closed.request.assert_not_awaited()
+        # Without the whitelist, allowed_friends is ignored.
+        self.assertTrue(self.make_adapter(allowed_friends=[]).friend_permitted("x"))
+        with self.assertRaises(ValueError):
+            self.make_adapter(allowed_friends=["123@chatroom"])
+
+    async def test_poll_admits_private_message_with_contact_name(self):
+        def event(cursor, **data):
+            return {
+                "cursor": cursor,
+                "kind": "message.committed",
+                "data": {
+                    "threadId": "wxid_friend",
+                    "messageId": "dm1",
+                    "origin": "live",
+                    "direction": "incoming",
+                }
+                | data,
+            }
+
+        self.adapter.request = AsyncMock(
+            side_effect=[
+                {"authenticated": True, "ownUsername": "wxid_bot"},
+                {
+                    "items": [
+                        event("1"),
+                        event("2", direction="outgoing", messageId="dm0"),
+                        event("3", origin="history", messageId="dm-old"),
+                    ]
+                },
+                {"id": "wxid_friend", "kind": "direct"},
+                self.native,
+                {"id": "wxid_friend", "displayName": "老朋友"},
+                asyncio.CancelledError(),
+            ]
+        )
+        with self.assertRaises(asyncio.CancelledError):
+            await self.adapter.run()
+        self.assertEqual(self.adapter._event_queue.qsize(), 1)
+        message = self.adapter._event_queue.get_nowait().message_obj
+        self.assertEqual(message.type, MessageType.FRIEND_MESSAGE)
+        self.assertEqual(message.sender.nickname, "老朋友(wxid_friend)")
+        paths = [c.args[1] for c in self.adapter.request.await_args_list]
+        self.assertIn("/threads/wxid_friend", paths)
+        self.assertIn("/contacts/wxid_friend", paths)
+        self.assertFalse(any("/groups/" in p for p in paths))
+        state = json.loads(Path(self.config["state_file"]).read_text())
+        self.assertEqual((state["cursor"], state["seen"]), ("3", ["dm1"]))
+
+    async def test_private_reply_is_sent_without_mentions(self):
+        self.verify()
+        message = self.adapter.convert(self.native, "live")
+        self.assertIsNone(self.adapter.mention_for(message))
+        self.adapter.ensure_reply_allowed = AsyncMock()
+        self.adapter.send_text = AsyncMock()
+        await NativeWeChatEvent(message, self.adapter).send(
+            MessageChain([Plain("你好呀")])
+        )
+        self.adapter.send_text.assert_awaited_once()
+        args = self.adapter.send_text.await_args.args
+        self.assertEqual((args[0], args[3]), ("wxid_friend", None))
+
+    async def test_send_text_to_private_chat_drops_at_tokens(self):
+        with self.assertRaises(ValueError):
+            await self.adapter.send_text("wxid_friend", "hi", "key")
+        self.verify()
+        self.adapter.request = AsyncMock(
+            side_effect=[
+                {"id": "send1", "state": "queued"},
+                {
+                    "id": "send1",
+                    "state": "server_accepted",
+                    "accountId": "account-test",
+                    "destination": "wxid_friend",
+                },
+            ]
+        )
+        await self.adapter.send_text(
+            "wxid_friend",
+            [("at", "wxid_friend"), ("plain", "该喝水了")],
+            "key",
+            {"userId": "wxid_friend", "label": "老朋友"},
+        )
+        body = self.adapter.request.await_args_list[0].kwargs["json"]
+        self.assertEqual(body, {"threadId": "wxid_friend", "text": "该喝水了"})
+
+    async def test_reply_rechecks_private_source(self):
+        self.verify()
+        source = self.adapter.convert(self.native, "live")
+        self.adapter.request = AsyncMock(
+            return_value=self.native | {"recall": {"state": "recalled"}}
+        )
+        with self.assertRaises(ValueError):
+            await self.adapter.reply(source, "reply", "key")
+        self.adapter.thread_kinds.clear()
+        self.adapter.request = AsyncMock(side_effect=BridgeHTTPError(404))
+        with self.assertRaises(ValueError):
+            await self.adapter.ensure_reply_allowed(source)
+
+    async def test_proactive_and_scheduled_private_messages(self):
+        from astrbot.core.platform.astr_message_event import current_message_event
+
+        self.verify()
+        session = SimpleNamespace(
+            session_id="wxid_friend", message_type=MessageType.FRIEND_MESSAGE
+        )
+        cron = FakeCronEvent(
+            {"session": "wechat-test:FriendMessage:wxid_friend", "sender_id": "x"}
+        )
+        token = current_message_event.set(cron)
+        self.addCleanup(current_message_event.reset, token)
+        self.adapter.send_text = AsyncMock()
+        await self.adapter.send_by_session(session, MessageChain([Plain("该喝水了")]))
+        self.assertIsNone(self.adapter.send_text.await_args.args[3])
+        self.assertTrue(cron.get_extra(CRON_DELIVERED_EXTRA))
+        for bad in (
+            SimpleNamespace(
+                session_id="wxid_x", message_type=MessageType.FRIEND_MESSAGE
+            ),
+            SimpleNamespace(
+                session_id="wxid_friend", message_type=MessageType.GROUP_MESSAGE
+            ),
+        ):
+            self.adapter.request = AsyncMock(side_effect=BridgeHTTPError(404))
+            with self.assertRaises(ValueError):
+                await self.adapter.send_by_session(bad, MessageChain([Plain("x")]))
+
+    async def test_plugin_delivers_private_cron_answer_and_private_hint(self):
+        manager = SimpleNamespace(
+            default_conf={
+                "platform": [
+                    {"id": "wechat-test", "type": "native_wechat", "enable": True}
+                ]
+            }
+        )
+        context = SimpleNamespace(astrbot_config_mgr=manager, send_message=AsyncMock())
+        plugin = NativeWeChatPlugin(context, {})
+        session = "wechat-test:FriendMessage:wxid_friend"
+        event = FakeCronEvent({"session": session})
+        resp = SimpleNamespace(role="assistant", completion_text="该喝水了")
+        await plugin.deliver_cron_result(event, resp)
+        self.assertEqual(context.send_message.await_args.args[0], session)
+        for other in ("wechat-test:OtherMessage:x", "wechat-test:FriendMessage:"):
+            await plugin.deliver_cron_result(FakeCronEvent({"session": other}), resp)
+        self.assertEqual(context.send_message.await_count, 1)
+        req = SimpleNamespace(system_prompt="人设")
+        private = SimpleNamespace(
+            get_platform_name=lambda: "native_wechat", is_private_chat=lambda: True
+        )
+        await plugin.add_wechat_style_hint(private, req)
+        self.assertEqual(req.system_prompt, "人设\n\n" + DEFAULT_PRIVATE_STYLE_HINT)
+        self.assertNotIn("群", DEFAULT_PRIVATE_STYLE_HINT)
+
+    async def test_private_profile_is_created_once_and_routed(self):
+        path = Path(self.temp.name) / "private.json"
+        path.write_text("{}")
+        platform = {
+            "id": "wechat",
+            "type": "native_wechat",
+            "enable": True,
+            "allowed_groups": [],
+            "chat_provider_id": "model",
+        }
+        source = {
+            "platform": [platform],
+            "provider_settings": {
+                "wake_prefix": "咪咪",
+                "streaming_response": True,
+                "identifier": False,
+            },
+            "platform_settings": {
+                "enable_id_white_list": True,
+                "id_whitelist": ["qq:FriendMessage:1"],
+            },
+            "agent_runner": {"config": {"model": {"provider_id": "old"}}},
+        }
+        before = copy.deepcopy(source)
+        routes = {"qq::": "qq-profile"}
+        manager = SimpleNamespace(
+            default_conf=source,
+            get_conf=Mock(return_value=source),
+            create_conf=AsyncMock(return_value="private-profile"),
+            confs={"private-profile": Profile({}, path)},
+            ucr=SimpleNamespace(
+                umop_to_conf_id=routes, update_routing_data=AsyncMock()
+            ),
+        )
+        plugin = NativeWeChatPlugin(SimpleNamespace(astrbot_config_mgr=manager))
+        await plugin.initialize()
+        supplied = manager.create_conf.await_args.args[0]
+        self.assertEqual(manager.create_conf.await_args.kwargs["name"], "微信 · 私聊")
+        self.assertEqual(supplied["provider_settings"]["wake_prefix"], "")
+        self.assertFalse(supplied["provider_settings"]["streaming_response"])
+        self.assertTrue(supplied["provider_settings"]["identifier"])
+        self.assertFalse(supplied["platform_settings"]["enable_id_white_list"])
+        self.assertEqual(
+            supplied["agent_runner"]["config"]["model"]["provider_id"], "model"
+        )
+        updated = manager.ucr.update_routing_data.await_args.args[0]
+        self.assertEqual(
+            list(updated.items()),
+            [("wechat:FriendMessage:*", "private-profile"), ("qq::", "qq-profile")],
+        )
+        self.assertEqual(source, before)
+        # Already routed to its own profile: nothing is created again.
+        routes["wechat:FriendMessage:*"] = "private-profile"
+        await plugin.initialize()
+        manager.create_conf.assert_awaited_once()
+        # Friend whitelist on and empty: private chats are off, no profile.
+        del routes["wechat:FriendMessage:*"]
+        platform |= {"friend_whitelist": True, "allowed_friends": []}
+        await plugin.initialize()
+        manager.create_conf.assert_awaited_once()
 
 
 if __name__ == "__main__":
