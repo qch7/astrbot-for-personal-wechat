@@ -80,8 +80,12 @@ $WX --account bot --json account status
   "state_file": "/AstrBot/data/wechat_personal/wechat_personal-state.json",
   "allowed_groups": ["123456789@chatroom"],
   "chat_provider_id": "你的提供商/模型",
-  "context_messages": true
+  "context_messages": true,
+  "friend_whitelist": false,
+  "allowed_friends": []
 }
 ```
+
+`friend_whitelist: false` 时所有好友都能私聊机器人；设为 `true` 后只有 `allowed_friends` 里的微信 ID 可以，列表为空即关闭私聊。私聊走插件自动创建的「微信 · 私聊」配置，需要语音转文字时在该配置里开启。
 
 编辑前先停止 AstrBot 容器，启动后再重启桥接容器。

@@ -4,7 +4,7 @@
 
 这是一个社区实验性适配器，使用本机运行的 `agent-wechat` 原生服务；不是腾讯官方机器人接口，也不是 AstrBot 官方内置微信适配器。本仓库提供 Python 插件、配置辅助脚本和部署文档，不包含微信客户端、桥接二进制、账号资料或模型密钥。
 
-> **本仓库是 [shuizhaodemumu/astrbot-for-personal-wechat](https://github.com/shuizhaodemumu/astrbot-for-personal-wechat) 的 fork（0.6.1）**，在 0.2.0 基础上增加：
+> **本仓库是 [shuizhaodemumu/astrbot-for-personal-wechat](https://github.com/shuizhaodemumu/astrbot-for-personal-wechat) 的 fork（0.7.0）**，在 0.2.0 基础上增加：
 >
 > - **群聊上下文**：平台配置 `context_messages: true` 时，白名单群里没有 @ 的文字也交给 AstrBot，供「群聊上下文感知」记录；这些消息不带 At，不会唤醒模型，也永远不会被回复（插件会丢弃针对它们的回复）。以 `context_skip_prefixes`（默认 `["/"]`）开头的未 @ 文字不转发，群成员不能绕过 @ 执行指令。
 > - **群昵称**：`resolve_member_names`（默认开）从桥接读取群成员昵称作为发送者名称，查不到时退回微信 ID；结果缓存一小时。
@@ -15,9 +15,10 @@
 > - **身份识别（0.4.1）**：`show_member_ids`（默认开）把成员显示为「昵称(wxid)」，昵称重名或冒充也能区分；消息 @ 了其他成员时附注被 @ 者；`text_mentions` 让手打的「@机器人群昵称」也算 @（微信只有从成员列表选择时才附带 @ 元数据）。
 > - **接收图片和语音（0.5）**：`receive_media`（默认开，需同时开启 `context_messages`）把群里的图片、语音作为群聊上下文交给 AstrBot：图片从桥接下载（优先 standard，原图仍在下载时最多等 15 秒，再退回缩略图），并校验大小与 SHA-256；语音是桥接解码好的 WAV，需要在该群配置里开启 AstrBot 的语音转文字（实测硅基流动 `FunAudioLLM/SenseVoiceSmall`，类型 OpenAI Whisper API）。动画表情记为「[动画表情]」。图片和语音无法 @，所以 @ 机器人时会附上被引用的图片，或提问者 `attach_recent_image_seconds`（默认 120 秒）内自己发的最后一张图（只附一次）。引用回复（type 49）现在当作文字处理，可以 @ 机器人，并注明引用了谁的什么内容。
 > - **主动消息与定时提醒（0.6）**：`proactive_messages: true` 时，任何主动发送（AstrBot 定时任务、插件、`send_message_to_user` 工具）都能发到白名单群，不限条数；平台随之声明支持主动消息，AstrBot 会把 `send_message_to_user` 提供给模型。消息链里的 At 组件（如 `mention_user`）会变成真正的微信 @。由群成员创建的定时任务，发出的第一段文字会自动 @ 创建者（消息里已 @ 他人、或创建者不是群成员时除外）。AstrBot 只投递定时任务里经 `send_message_to_user` 发出的内容，模型若只写了最终回复，插件会在 `on_llm_response` 中把这条回复补发到群里（去掉「任务完成、提醒已送达」之类的说明）。在群里 @ 机器人说「每天早上 8 点提醒我……」即可创建，需要开启 `provider_settings.proactive_capability.add_cron_tools`。个人号主动发消息越多，风控风险越高。
+> - **好友私聊（0.7）**：默认回复所有好友的私聊，不需要 @。只有桥接标记为 `direct` 的会话才算私聊，微信团队、公众号等系统会话一律忽略。平台配置 `friend_whitelist: true` 后只回复 `allowed_friends` 里的微信 ID（列表为空即关闭私聊）。插件为私聊建一个独立配置「微信 · 私聊」（路由 `<平台ID>:FriendMessage:*`，模型用 `chat_provider_id`，开启「识别发送者」），新建时关闭它从原配置继承的 ID 白名单，否则 AstrBot 会静默拦截所有好友；谁能私聊由上面两项决定。私聊里的文字、引用、图片、语音、动画表情都会单独回复，回复不 @ 对方；语音需要在这个配置里开启语音转文字。定时提醒和主动消息也能发到私聊。插件配置 `private_reply_style_hint` 是私聊用的风格提示。**从旧版本升级后，所有好友都能私聊机器人**；只想服务群的部署请设 `friend_whitelist: true` 并留空 `allowed_friends`。
 > - **Docker 部署**：见 [docs/DOCKER.md](docs/DOCKER.md)。
 >
-> 安全提示：AstrBot 的本地代码执行（`computer_use_local_permissions`）如果对普通成员开放，任何群成员 @ 机器人都可能让它在 AstrBot 所在环境执行命令、读取包含 API key 和桥接令牌的配置文件。建议普通成员关闭执行并把文件范围限制为 `workspace`。
+> 安全提示：AstrBot 的本地代码执行（`computer_use_local_permissions`）如果对普通成员开放，任何群成员 @ 机器人、任何好友私聊机器人，都可能让它在 AstrBot 所在环境执行命令、读取包含 API key 和桥接令牌的配置文件。建议普通成员关闭执行并把文件范围限制为 `workspace`。
 
 ## 工作方式
 
@@ -35,8 +36,8 @@ flowchart LR
 
 ## 当前能力
 
-- 只接收配置中列出的微信群、明确 @当前微信号的文字消息。
-- 忽略私聊、其他群、自己发送的消息、历史回放和仅 @全体成员的消息。
+- 只接收配置中列出的微信群、明确 @当前微信号的文字消息，以及好友私聊（fork 0.7，可用好友白名单限制）。
+- 忽略其他群、系统和公众号会话、自己发送的消息、历史回放和仅 @全体成员的消息。
 - 为尚未绑定独立配置的目标群创建 AstrBot 配置，指定聊天模型，取消额外的模型唤醒前缀；不修改其他平台的默认设置。
 - 在插件设置中按群名显示允许回复的群，每个群可独立选择人格。
 - 保存人格选择后自动重载插件；默认在切换人格时新建对话，旧会话记录保留。
