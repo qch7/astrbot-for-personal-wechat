@@ -1,10 +1,10 @@
 # AstrBot for Personal WeChat
 
-让个人微信测试号在指定微信群中接收 **@自己的文字消息**，交给 AstrBot 调用模型，再把文字回复发回原群。
+让个人微信测试号通过指定微信群中的 **@消息** 或好友私聊接入 AstrBot，收发文字、图片和文件，并接收语音消息。
 
 这是一个社区实验性适配器，使用本机运行的 `agent-wechat` 原生服务；不是腾讯官方机器人接口，也不是 AstrBot 官方内置微信适配器。本仓库提供 Python 插件、配置辅助脚本和部署文档，不包含微信客户端、桥接二进制、账号资料或模型密钥。
 
-> **本仓库是 [shuizhaodemumu/astrbot-for-personal-wechat](https://github.com/shuizhaodemumu/astrbot-for-personal-wechat) 的 fork（0.7.0）**，在 0.2.0 基础上增加：
+> **本仓库是 [shuizhaodemumu/astrbot-for-personal-wechat](https://github.com/shuizhaodemumu/astrbot-for-personal-wechat) 的 fork（0.8.1）**，在 0.2.0 基础上增加：
 >
 > - **群聊上下文**：平台配置 `context_messages: true` 时，白名单群里没有 @ 的文字也交给 AstrBot，供「群聊上下文感知」记录；这些消息不带 At，不会唤醒模型，也永远不会被回复（插件会丢弃针对它们的回复）。以 `context_skip_prefixes`（默认 `["/"]`）开头的未 @ 文字不转发，群成员不能绕过 @ 执行指令。
 > - **群昵称**：`resolve_member_names`（默认开）从桥接读取群成员昵称作为发送者名称，查不到时退回微信 ID；结果缓存一小时。
@@ -17,6 +17,7 @@
 > - **主动消息与定时提醒（0.6）**：`proactive_messages: true` 时，任何主动发送（AstrBot 定时任务、插件、`send_message_to_user` 工具）都能发到白名单群，不限条数；平台随之声明支持主动消息，AstrBot 会把 `send_message_to_user` 提供给模型。消息链里的 At 组件（如 `mention_user`）会变成真正的微信 @。由群成员创建的定时任务，发出的第一段文字会自动 @ 创建者（消息里已 @ 他人、或创建者不是群成员时除外）。AstrBot 只投递定时任务里经 `send_message_to_user` 发出的内容，模型若只写了最终回复，插件会在 `on_llm_response` 中把这条回复补发到群里（去掉「任务完成、提醒已送达」之类的说明）。在群里 @ 机器人说「每天早上 8 点提醒我……」即可创建，需要开启 `provider_settings.proactive_capability.add_cron_tools`。个人号主动发消息越多，风控风险越高。
 > - **好友私聊（0.7）**：默认回复所有好友的私聊，不需要 @。只有桥接标记为 `direct` 的会话才算私聊，微信团队、公众号等系统会话一律忽略。平台配置 `friend_whitelist: true` 后只回复 `allowed_friends` 里的微信 ID（列表为空即关闭私聊）。插件为私聊建一个独立配置「微信 · 私聊」（路由 `<平台ID>:FriendMessage:*`，模型用 `chat_provider_id`，开启「识别发送者」），新建时关闭它从原配置继承的 ID 白名单，否则 AstrBot 会静默拦截所有好友；谁能私聊由上面两项决定。私聊里的文字、引用、图片、语音、动画表情都会单独回复，回复不 @ 对方；语音需要在这个配置里开启语音转文字。定时提醒和主动消息也能发到私聊。插件配置 `private_reply_style_hint` 是私聊用的风格提示。**从旧版本升级后，所有好友都能私聊机器人**；只想服务群的部署请设 `friend_whitelist: true` 并留空 `allowed_friends`。
 > - **Docker 部署**：见 [docs/DOCKER.md](docs/DOCKER.md)。
+> - **0.8 版本支持文件收发**。开启 `receive_media` 后，接收微信普通文件消息（type 49/subtype 6），按需下载，校验长度和 SHA-256，并交给 AstrBot 的 `File` 附件入口。好友私聊发文件即可触发处理。群文件作为上下文接收，随后同一发送者在 `attach_recent_file_seconds`（默认 120 秒）内 @ 机器人时会附上最近的图片或文件，也可以引用该群已接收的文件再 @。0.8.1 可从当前会话保存的最近 1000 条消息中查找被引用的原文件，支持重启后的旧文件引用。单文件收发上限为 50 MiB，最多等待下载 60 秒，失败会显示「文件未能获取」。文件保存在 AstrBot 临时目录中，保留经过路径清理的文件名，缓存保留一小时。AstrBot 的文件读取工具支持 PDF 文本、DOCX 等格式，内容解析使用该会话已有的工具与文件解析配置。回复或 `send_message_to_user` 中的 `File` 消息段会保留文件名上传并发送回原会话，普通回复、流式回复、定时任务均支持，并通过桥接任务回执确认结果。
 >
 > 安全提示：AstrBot 的本地代码执行（`computer_use_local_permissions`）如果对普通成员开放，任何群成员 @ 机器人、任何好友私聊机器人，都可能让它在 AstrBot 所在环境执行命令、读取包含 API key 和桥接令牌的配置文件。建议普通成员关闭执行并把文件范围限制为 `workspace`。
 
@@ -113,8 +114,8 @@ LICENSE                       本仓库许可证
 
 ## 限制与行为边界
 
-- 当前只处理文字；不支持图片、语音、文件和主动群发，也不提供自动加群或批量加好友。
-- 模型返回的非文字组件不会发送；流式输出会合并后发送。
+- 支持接收文字、引用回复、图片、语音、动画表情和普通文件，回复可包含文字、图片、文件和 @。
+- 流式输出会合并后发送。
 - 重启后忽略启动前的消息；超过 5 分钟的消息也不会回复。模型处理过慢时，发送前检查可能丢弃结果。
 - 游标在交给 AstrBot 之前落盘，优先避免重复回复。进程恰在落盘后崩溃时，可能漏掉该条消息；不承诺恰好一次投递。
 - 发送结果不确定时，不会自动重新提交。需要查看桥接发送记录判断实际状态。

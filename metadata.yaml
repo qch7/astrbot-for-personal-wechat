@@ -1,6 +1,6 @@
 name: astrbot_plugin_native_wechat
 display_name: AstrBot for Personal WeChat
-desc: 基于本机 agent-wechat 原生 API 的指定微信群 @ 回复与好友私聊适配器（文字、图片、语音、群聊上下文）。
-version: 0.7.0
+desc: 基于本机 agent-wechat 原生 API 的指定微信群 @ 回复与好友私聊适配器（文字、图片、语音、文件收发、群聊上下文）。
+version: 0.8.1
 author: shuizhaodemumu, qch7
 repo: https://github.com/qch7/astrbot-for-personal-wechat
