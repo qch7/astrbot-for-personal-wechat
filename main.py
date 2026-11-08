@@ -3,23 +3,25 @@
 # Modified 2026 by qch7 (fork): group context messages, member nicknames,
 # per-group whitelist/profile defaults, bot-offline alerts, image replies,
 # @-mentioning the asker, WeChat reply-style hints, incoming images/voice,
-# quote replies and private chats with friends.
+# quote replies, incoming files and private chats with friends.
 
 import asyncio
 import copy
 import hashlib
 import json
+import mimetypes
 import re
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import aiohttp
 from astrbot.api import logger, sp
 from astrbot.api.event import MessageChain
 from astrbot.api.event import filter as event_filter
-from astrbot.api.message_components import At, Image, Plain, Record
+from astrbot.api.message_components import At, File, Image, Plain, Record
 from astrbot.api.platform import (
     AstrBotMessage,
     AstrMessageEvent,
@@ -30,6 +32,7 @@ from astrbot.api.platform import (
     register_platform_adapter,
 )
 from astrbot.api.star import Star, register
+from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 from astrbot.core.utils.session_lock import session_lock_manager
 
 LOCAL_BRIDGE = "http://127.0.0.1:6174"
@@ -49,9 +52,20 @@ MEDIA_TERMINAL_STATES = MEDIA_SUCCESS_STATES | {
 IMAGE_MAX_BYTES = 26214383  # bridge mediaSendMaxBytes.image
 MENTION_SEPARATOR = "\u2005"  # WeChat mention terminator (four-per-em space)
 QUOTE_APP_MESSAGE_TYPE = 57  # type 49 "reply with quote"
+FILE_APP_MESSAGE_TYPE = 6
+FILE_MAX_BYTES = 50 * 1024 * 1024
 MEDIA_MESSAGE_KINDS = {3: "image", 34: "voice", 47: "sticker"}
-MEDIA_PLACEHOLDERS = {"image": "[图片]", "voice": "[语音] ", "sticker": "[动画表情]"}
-MEDIA_VARIANTS = {"image": ("standard", "original", "thumbnail"), "voice": ("normal",)}
+MEDIA_PLACEHOLDERS = {
+    "image": "[图片]",
+    "voice": "[语音] ",
+    "sticker": "[动画表情]",
+    "file": "[文件]",
+}
+MEDIA_VARIANTS = {
+    "image": ("standard", "original", "thumbnail"),
+    "voice": ("normal",),
+    "file": ("original",),
+}
 MEDIA_PENDING_STATES = {"pending", "queued", "running", "downloading"}
 MEDIA_FILE_TTL = 3600
 VOICE_MAX_BYTES = 26214383
@@ -120,8 +134,15 @@ def image_mime(data):
     return None, None
 
 
+def safe_filename(value):
+    name = re.split(r"[\\/]", value or "attachment")[-1]
+    name = re.sub(r'[\x00-\x1f\x7f<>:"|?*]', "_", name).strip(" .")
+    name = name.encode("utf-8")[:180].decode("utf-8", errors="ignore")
+    return name or "attachment"
+
+
 def outgoing_segments(chain, images=True):
-    """Split a message chain into ordered text and image parts.
+    """Split a message chain into ordered text, image and file parts.
 
     Text parts are token lists of ("plain", str) and ("at", user_id), so At
     components (e.g. from send_message_to_user's mention_user) become real
@@ -142,6 +163,9 @@ def outgoing_segments(chain, images=True):
         elif images and isinstance(part, Image):
             flush()
             segments.append(("image", part))
+        elif isinstance(part, File):
+            flush()
+            segments.append(("file", part))
     flush()
     return segments
 
@@ -179,15 +203,19 @@ class NativeWeChatEvent(AstrMessageEvent):
                     key,
                     self.platform.mention_for(self.message_obj) if mention else None,
                 )
-            else:
+            elif kind == "image":
                 await self.platform.send_image(thread, value, key)
+            else:
+                await self.platform.send_file(thread, value, key)
         await super().send(message)
 
     async def send_streaming(self, generator, use_fallback=False):
         parts = []
         async for message in generator:
             parts.extend(
-                part for part in message.chain if isinstance(part, Plain | Image | At)
+                part
+                for part in message.chain
+                if isinstance(part, Plain | Image | File | At)
             )
         if parts:
             await self.send(MessageChain(parts))
@@ -195,7 +223,7 @@ class NativeWeChatEvent(AstrMessageEvent):
 
 @register_platform_adapter(
     "native_wechat",
-    "本机个人微信：指定群 @ 回复（文字、图片）",
+    "本机个人微信：指定群 @ 回复与好友私聊（文字、图片、文件）",
     default_config_tmpl={
         "server_url": "http://127.0.0.1:6174",
         "account_id": "",
@@ -215,6 +243,7 @@ class NativeWeChatEvent(AstrMessageEvent):
         "text_mentions": False,
         "receive_media": True,
         "attach_recent_image_seconds": 120,
+        "attach_recent_file_seconds": 120,
         "friend_whitelist": False,
         "allowed_friends": [],
     },
@@ -258,11 +287,13 @@ class NativeWeChatAdapter(Platform):
         # Also treat a typed "@<bot group nickname>" as a mention (WeChat only
         # attaches mention metadata when the member is picked from the list).
         self.text_mentions = bool(config.get("text_mentions", False))
-        # Images and voice are forwarded as group context (they cannot carry
-        # an @); an @ message also gets the sender's recent or quoted image.
+        # Media is group context until an @ refers to a recent image or file.
         self.receive_media = bool(config.get("receive_media", True))
         self.attach_window = max(
             0, int(config.get("attach_recent_image_seconds", 120) or 0)
+        )
+        self.file_attach_window = max(
+            0, int(config.get("attach_recent_file_seconds", 120) or 0)
         )
         # Private chats: every friend may talk to the bot, unless the friend
         # whitelist is enabled; then only allowed_friends (empty = nobody).
@@ -279,8 +310,11 @@ class NativeWeChatAdapter(Platform):
         self.thread_kinds = {}
         self.contact_names = {}
         self.media_dir = self.state_file.parent / "media"
-        self.recent_images = {}
-        self.images_by_server_id = {}
+        # AstrBot's workspace-scoped file tools may read its temporary directory.
+        namespace = hashlib.sha256(str(self.state_file.resolve()).encode()).hexdigest()
+        self.file_dir = Path(get_astrbot_temp_path()) / "native_wechat" / namespace[:16]
+        self.recent_attachments = {}
+        self.attachments_by_server_id = {}
         self.tasks = set()
         self.member_names = {}
         self.member_refreshed = {}
@@ -386,13 +420,15 @@ class NativeWeChatAdapter(Platform):
         return name or username
 
     def message_kind(self, native):
-        """Classify a native message as text, image, voice or sticker (or None)."""
+        """Classify supported text, images, voice, stickers and ordinary files."""
         kind = native.get("type")
         if kind == 1:
             return "text"
         if kind == 49 and native.get("appMessageType") == QUOTE_APP_MESSAGE_TYPE:
             return "text"  # reply with a quote: its body is ordinary text
         if self.receive_media:
+            if kind == 49 and native.get("appMessageType") == FILE_APP_MESSAGE_TYPE:
+                return "file"
             return MEDIA_MESSAGE_KINDS.get(kind)
         return None
 
@@ -524,7 +560,7 @@ class NativeWeChatAdapter(Platform):
                             ):
                                 raise RuntimeError("WeChat message identity mismatch")
                             if native["id"] not in self.seen:
-                                self.remember_image(native)
+                                self.remember_attachment(native)
                                 if (
                                     self.text_mentions
                                     and self.own_id
@@ -555,11 +591,18 @@ class NativeWeChatAdapter(Platform):
                         temporary.chmod(0o600)
                         temporary.replace(self.state_file)
                         if message:
-                            image_ref = self.referenced_image(message)
-                            if message.wechat_kind in ("image", "voice") or image_ref:
+                            attachment_ref = self.referenced_attachment(message)
+                            quoted_file = self.quoted_file(message)
+                            if (
+                                message.wechat_kind in MEDIA_VARIANTS
+                                or attachment_ref
+                                or quoted_file
+                            ):
                                 # Downloads may wait for the bridge; never stall
                                 # the event loop for later messages.
-                                self.spawn(self.finish_and_commit(message, image_ref))
+                                self.spawn(
+                                    self.finish_and_commit(message, attachment_ref)
+                                )
                             else:
                                 self.dispatch(message)
                     await asyncio.sleep(1 if len(page["items"]) < 100 else 0)
@@ -597,90 +640,190 @@ class NativeWeChatAdapter(Platform):
         task.add_done_callback(self.tasks.discard)
         return task
 
-    def remember_image(self, native):
-        """Track incoming images so a later @ or quote can show them to the model.
+    def remember_attachment(self, native):
+        """Track incoming images/files for a later @ or quote in the same chat.
 
-        Private images are answered on their own, so they are only kept for
-        quotes, not attached to the friend's next message.
+        Private images are only kept for quotes. A file also accompanies the
+        next private question, which may arrive while its download is running.
         """
+        kind = self.message_kind(native)
         if (
-            not self.receive_media
-            or native.get("type") != 3
+            kind not in ("image", "file")
             or native.get("direction") != "incoming"
             or not self.thread_permitted(native.get("threadId"))
         ):
             return
-        if native["threadId"] in self.allowed_groups:
+        if native["threadId"] in self.allowed_groups or kind == "file":
             key = (native["threadId"], native.get("senderId"))
-            self.recent_images[key] = (time.monotonic(), native["id"])
+            self.recent_attachments[key] = (time.monotonic(), kind, native["id"])
         if native.get("serverId"):
-            self.images_by_server_id[str(native["serverId"])] = native["id"]
-            while len(self.images_by_server_id) > 500:
-                self.images_by_server_id.pop(next(iter(self.images_by_server_id)))
+            key = (native["threadId"], str(native["serverId"]))
+            self.attachments_by_server_id[key] = (kind, native["id"])
+            while len(self.attachments_by_server_id) > 500:
+                self.attachments_by_server_id.pop(
+                    next(iter(self.attachments_by_server_id))
+                )
 
-    def referenced_image(self, message):
-        """Return the message ID of the image an @ message refers to, if any.
+    def referenced_attachment(self, message):
+        """Return (kind, message ID) for a quoted or recent image/file.
 
-        A quoted image wins; otherwise the sender's own latest image within
-        attach_recent_image_seconds (used once).
+        A quote wins; otherwise use the sender's own latest attachment within
+        its configured window, once. Attachments from other chats never match.
         """
         native = message.raw_message
         if message.wechat_kind != "text" or not self.is_directed(message):
             return None
         quoted = native.get("quote") or {}
-        if quoted.get("type") == 3 and quoted.get("serverId"):
-            found = self.images_by_server_id.get(str(quoted["serverId"]))
+        if quoted.get("serverId"):
+            found = self.attachments_by_server_id.get(
+                (native["threadId"], str(quoted["serverId"]))
+            )
             if found:
                 return found
+            if self.quoted_file(message):
+                return None
         key = (native["threadId"], native["senderId"])
-        recent = self.recent_images.get(key)
-        if (
-            recent
-            and self.attach_window
-            and time.monotonic() - recent[0] <= self.attach_window
-        ):
-            self.recent_images.pop(key, None)
-            return recent[1]
+        recent = self.recent_attachments.get(key)
+        if recent:
+            window = (
+                self.attach_window if recent[1] == "image" else self.file_attach_window
+            )
+            if window and time.monotonic() - recent[0] <= window:
+                self.recent_attachments.pop(key, None)
+                return recent[1:]
         return None
 
-    async def finish_and_commit(self, message, image_ref=None):
+    def quoted_file(self, message):
+        quoted = message.raw_message.get("quote") or {}
+        return (
+            message.wechat_kind == "text"
+            and self.is_directed(message)
+            and quoted.get("type") == 49
+            and quoted.get("appMessageType") == FILE_APP_MESSAGE_TYPE
+            and bool(quoted.get("serverId"))
+        )
+
+    async def resolve_quoted_file(self, message):
+        """Find a quoted original in this chat's saved history after a restart."""
+        if not self.quoted_file(message):
+            return None
+        native = message.raw_message
+        thread = native["threadId"]
+        if not await self.thread_allowed(thread):
+            return None
+        quoted = native["quote"]
+        cursor = None
+        for _ in range(10):
+            params = {"limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            page = await self.request(
+                "GET",
+                "/threads/" + quote(thread, safe="") + "/messages?" + urlencode(params),
+            )
+            for original in page.get("items", []):
+                if str(original.get("serverId")) != str(quoted["serverId"]):
+                    continue
+                if (
+                    original.get("accountId") != self.account_id
+                    or original.get("threadId") != thread
+                ):
+                    raise RuntimeError("Quoted WeChat file identity mismatch")
+                if (
+                    original.get("recall")
+                    or original.get("direction") != "incoming"
+                    or self.message_kind(original) != "file"
+                    or (
+                        quoted.get("senderId")
+                        and quoted["senderId"] != original.get("senderId")
+                    )
+                ):
+                    return None
+                result = ("file", original["id"])
+                self.attachments_by_server_id[(thread, str(quoted["serverId"]))] = (
+                    result
+                )
+                if len(self.attachments_by_server_id) > 500:
+                    self.attachments_by_server_id.pop(
+                        next(iter(self.attachments_by_server_id))
+                    )
+                return result
+            next_cursor = page.get("nextCursor")
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+        return None
+
+    async def finish_and_commit(self, message, attachment_ref=None):
         try:
-            if message.wechat_kind in ("image", "voice"):
+            if attachment_ref is None and self.quoted_file(message):
+                attachment_ref = await self.resolve_quoted_file(message)
+                if attachment_ref is None:
+                    label = "[引用文件未能获取，请重新发送原文件]"
+                    message.message.append(Plain(label))
+                    message.message_str += "\n" + label
+            if message.wechat_kind in MEDIA_VARIANTS:
                 await self.attach_media(message)
-            if image_ref:
-                path = await self.download_media(image_ref, "image")
-                if path:
-                    message.message.append(Image.fromFileSystem(str(path)))
+            if attachment_ref:
+                await self.attach_media(message, attachment_ref)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # media is best effort; still deliver the text
             logger.warning("Native WeChat media handling failed: %s", str(exc))
+            if (
+                message.wechat_kind == "file"
+                or self.quoted_file(message)
+                or (attachment_ref and attachment_ref[0] == "file")
+            ):
+                label = "[文件]（未能获取）"
+                if attachment_ref or self.quoted_file(message):
+                    message.message.append(Plain(label))
+                    message.message_str += "\n" + label
+                else:
+                    message.message = [Plain(label)]
+                    message.message_str = label
         self.dispatch(message)
 
-    async def attach_media(self, message):
-        """Replace a media placeholder with the downloaded Image/Record."""
-        kind = message.wechat_kind
-        path = await self.download_media(message.message_id, kind)
-        if not path:
-            message.message = [Plain(MEDIA_PLACEHOLDERS[kind].strip() + "（未能获取）")]
+    async def attach_media(self, message, attachment_ref=None):
+        """Attach a downloaded Image/Record/File, or an explicit failure label."""
+        kind, message_id = attachment_ref or (message.wechat_kind, message.message_id)
+        path = await self.download_media(
+            message_id, kind, wait=60 if kind == "file" else 15
+        )
+        if not path and attachment_ref and kind == "image":
             return
-        if kind == "image":
-            message.message = [Image.fromFileSystem(str(path))]
+        if not path:
+            components = [Plain(MEDIA_PLACEHOLDERS[kind].strip() + "（未能获取）")]
+        elif kind == "image":
+            components = [Image.fromFileSystem(str(path))]
+        elif kind == "file":
+            name = re.sub(r"^file-[0-9a-f]{24}-", "", path.name)
+            components = [Plain(f"[文件：{name}]"), File(name=name, file=str(path))]
         else:
             # AstrBot's speech-to-text replaces the Record with its transcript.
-            message.message = [
+            components = [
                 Plain(MEDIA_PLACEHOLDERS["voice"]),
                 Record.fromFileSystem(str(path)),
             ]
+        if kind == "file":
+            label = components[0].text
+            message.message_str = (
+                message.message_str + "\n" + label if attachment_ref else label
+            )
+        if attachment_ref:
+            message.message.extend(components)
+        else:
+            message.message = components
 
     async def download_media(self, message_id, kind, wait=15):
-        """Fetch the best available image/voice asset of a message to disk.
+        """Fetch an image/voice/file asset, starting uncached file downloads once.
 
         Waits up to `wait` seconds while the bridge is still downloading it.
         Returns the file path, or None when no usable asset becomes available.
         """
         variants = MEDIA_VARIANTS[kind]
         deadline = time.monotonic() + wait
+        transfer_started = False
         while True:
             try:
                 page = await self.request(
@@ -694,6 +837,33 @@ class NativeWeChatAdapter(Platform):
                 for a in page.get("items") or []
                 if a.get("kind") == kind
             }
+            if kind == "file":
+                for asset in assets.values():
+                    if asset.get("accountId", self.account_id) != self.account_id or (
+                        asset.get("messageId", message_id) != message_id
+                    ):
+                        raise RuntimeError("WeChat file asset identity mismatch")
+                    sizes = (asset.get("byteLength"), asset.get("advertisedByteLength"))
+                    if any(isinstance(n, int) and n > FILE_MAX_BYTES for n in sizes):
+                        logger.warning("WeChat file exceeds the 50 MiB receive limit")
+                        return None
+                    if (
+                        asset.get("state") == "pending"
+                        and not asset.get("jobId")
+                        and not transfer_started
+                    ):
+                        await self.request(
+                            "POST",
+                            "/messages/"
+                            + quote(message_id, safe="")
+                            + "/media-transfers",
+                            json={
+                                "messageId": message_id,
+                                "assetId": asset["id"],
+                                "quality": "best",
+                            },
+                        )
+                        transfer_started = True
             rank = next(
                 (
                     i
@@ -716,7 +886,11 @@ class NativeWeChatAdapter(Platform):
             await asyncio.sleep(1)
 
     async def save_asset(self, asset, kind):
-        limit = IMAGE_MAX_BYTES if kind == "image" else VOICE_MAX_BYTES
+        limit = {
+            "image": IMAGE_MAX_BYTES,
+            "voice": VOICE_MAX_BYTES,
+            "file": FILE_MAX_BYTES,
+        }[kind]
         data = await self.request_bytes(
             "/media/" + quote(asset["id"], safe="") + "/content", limit
         )
@@ -735,22 +909,39 @@ class NativeWeChatAdapter(Platform):
             if not extension:
                 logger.warning("WeChat image asset has an unknown format")
                 return None
-        else:
+        elif kind == "voice":
             if data[:4] != b"RIFF":
                 logger.warning("WeChat voice asset is not WAV")
                 return None
             extension = "wav"
-        self.media_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.prune_media()
         digest = hashlib.sha256(data).hexdigest()[:24]
-        path = self.media_dir / f"{kind}-{digest}.{extension}"
-        path.write_bytes(data)
-        path.chmod(0o600)
+        if kind == "file":
+            path = (
+                self.file_dir / f"file-{digest}-{safe_filename(asset.get('filename'))}"
+            )
+        else:
+            path = self.media_dir / f"{kind}-{digest}.{extension}"
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.prune_media()
+        # Concurrent references to the same attachment must see complete bytes.
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            try:
+                temporary.chmod(0o600)
+                stream.write(data)
+            except BaseException:
+                stream.close()
+                temporary.unlink(missing_ok=True)
+                raise
+        try:
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
         return path
 
     def prune_media(self):
         cutoff = time.time() - MEDIA_FILE_TTL
-        for old in self.media_dir.glob("*"):
+        for old in (*self.media_dir.glob("*"), *self.file_dir.glob("*")):
             try:
                 if old.is_file() and old.stat().st_mtime < cutoff:
                     old.unlink()
@@ -969,17 +1160,38 @@ class NativeWeChatAdapter(Platform):
 
     async def send_image(self, group, image, key):
         """Upload one image to the bridge and send it to an allowed thread."""
+        await self.send_media(group, image, key, "image")
+
+    async def send_file(self, group, file, key):
+        """Upload a File component while preserving its display name."""
+        await self.send_media(group, file, key, "file")
+
+    async def send_media(self, group, component, key, kind):
+        """Send an attachment once and verify the account-scoped media job."""
         if not self.thread_permitted(group):
             raise ValueError("Reply target is not approved")
-        path = Path(await image.convert_to_file_path())
-        data = path.read_bytes()
-        if not data or len(data) > IMAGE_MAX_BYTES:
-            raise ValueError("Image is empty or larger than the bridge limit")
-        mime, extension = image_mime(data)
-        if not mime:
-            raise ValueError("Unsupported image format")
+        if kind == "file":
+            file_path = await component.get_file()
+            if not file_path:
+                raise ValueError("WeChat outgoing file is unavailable")
+            path = Path(file_path)
+            filename = safe_filename(component.name or path.name)
+            mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            limit = FILE_MAX_BYTES
+        else:
+            path = Path(await component.convert_to_file_path())
+            limit = IMAGE_MAX_BYTES
+        with path.open("rb") as stream:
+            data = stream.read(limit + 1)
+        if not data or len(data) > limit:
+            raise ValueError(f"WeChat {kind} is empty or larger than {limit} bytes")
+        if kind == "image":
+            mime, extension = image_mime(data)
+            if not mime:
+                raise ValueError("Unsupported image format")
+            filename = f"image.{extension}"
         form = aiohttp.FormData()
-        form.add_field("file", data, filename=f"image.{extension}", content_type=mime)
+        form.add_field("file", data, filename=filename, content_type=mime)
         source = await self.request("POST", "/uploads", data=form)
         job = await self.request(
             "POST",
@@ -987,7 +1199,7 @@ class NativeWeChatAdapter(Platform):
             headers={"Idempotency-Key": key},
             json={
                 "threadId": group,
-                "kind": "image",
+                "kind": kind,
                 "sourceId": source["id"],
                 "standardSourceId": None,
                 "thumbnailSourceId": None,
@@ -1009,7 +1221,7 @@ class NativeWeChatAdapter(Platform):
             raise RuntimeError("WeChat media job identity mismatch")
         if job.get("state") not in MEDIA_SUCCESS_STATES:
             raise RuntimeError(
-                f"WeChat image delivery is unconfirmed ({job.get('state')}); "
+                f"WeChat {kind} delivery is unconfirmed ({job.get('state')}); "
                 "do not automatically resend"
             )
 
@@ -1168,8 +1380,10 @@ class NativeWeChatAdapter(Platform):
             if kind == "text":
                 await self.send_text(group, value, key, mention if first_text else None)
                 first_text = False
-            else:
+            elif kind == "image":
                 await self.send_image(group, value, key)
+            else:
+                await self.send_file(group, value, key)
         if payload:
             # Tells the plugin's fallback that this run has already delivered.
             self.cron_event(group, message_type).set_extra(CRON_DELIVERED_EXTRA, True)
@@ -1181,7 +1395,10 @@ class NativeWeChatAdapter(Platform):
 
 
 @register(
-    "astrbot_plugin_native_wechat", "shuizhaodemumu", "本机微信指定群文字接入", "0.7.0"
+    "astrbot_plugin_native_wechat",
+    "shuizhaodemumu",
+    "本机微信指定群及好友接入",
+    "0.8.1",
 )
 class NativeWeChatPlugin(Star):
     def __init__(self, context, config=None):

@@ -11,13 +11,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import At, Image, Plain, Record
+from astrbot.api.message_components import At, File, Image, Plain, Record
 from astrbot.api.platform import MessageType
 
 from main import (
     CRON_DELIVERED_EXTRA,
     DEFAULT_PRIVATE_STYLE_HINT,
     DEFAULT_STYLE_HINT,
+    FILE_MAX_BYTES,
     BridgeHTTPError,
     NativeWeChatAdapter,
     NativeWeChatEvent,
@@ -558,6 +559,104 @@ class OutgoingMediaTests(unittest.IsolatedAsyncioTestCase):
         await event.send(MessageChain([Plain("第二条")]))
         self.assertIsNone(self.adapter.send_text.await_args.args[3])
 
+    async def test_file_upload_preserves_name_for_group_and_private(self):
+        for thread in ("123@chatroom", "wxid_friend"):
+            self.adapter.thread_kinds["wxid_friend"] = (
+                "direct",
+                time.monotonic() + 3600,
+            )
+            self.adapter.request = AsyncMock(
+                side_effect=[
+                    {"id": "upload_file"},
+                    {"id": "job1", "state": "queued"},
+                    self.job_done | {"threadId": thread},
+                ]
+            )
+            with patch("main.asyncio.sleep", AsyncMock()):
+                await self.adapter.send_file(
+                    thread, File(name="../报告.pdf", file=str(self.png)), "file-key"
+                )
+            upload, send, poll = self.adapter.request.await_args_list
+            form_field = upload.kwargs["data"]._fields[0]
+            self.assertEqual(form_field[0]["filename"], "报告.pdf")
+            self.assertEqual(form_field[2], PNG_1X1)
+            self.assertEqual(send.kwargs["json"]["kind"], "file")
+            self.assertEqual(send.kwargs["json"]["threadId"], thread)
+            self.assertEqual(send.kwargs["headers"]["Idempotency-Key"], "file-key")
+            self.assertEqual(poll.args, ("GET", "/jobs/job1"))
+
+    async def test_file_send_rejects_missing_oversized_and_unapproved_inputs(self):
+        self.adapter.request = AsyncMock()
+        for thread, attachment in (
+            ("other@chatroom", File(name="x", file=str(self.png))),
+            ("123@chatroom", File(name="x", file=str(self.png.parent / "missing"))),
+        ):
+            with self.assertRaises(ValueError):
+                await self.adapter.send_file(thread, attachment, "key")
+        with patch("main.FILE_MAX_BYTES", 4), self.assertRaises(ValueError):
+            await self.adapter.send_file(
+                "123@chatroom", File(name="x", file=str(self.png)), "key"
+            )
+        self.adapter.request.assert_not_awaited()
+
+    async def test_file_failed_or_uncertain_jobs_are_not_retried(self):
+        for result in (
+            self.job_done | {"state": "failed"},
+            self.job_done | {"state": "needs_review"},
+            self.job_done | {"accountId": "other"},
+            self.job_done | {"threadId": "other@chatroom"},
+        ):
+            self.adapter.request = AsyncMock(side_effect=[{"id": "upload"}, result])
+            with self.assertRaises(RuntimeError):
+                await self.adapter.send_file(
+                    "123@chatroom", File(name="x.pdf", file=str(self.png)), "key"
+                )
+            self.assertEqual(self.adapter.request.await_count, 2)
+
+    async def test_files_survive_normal_and_streaming_reply_chains(self):
+        attachment = File(name="report.pdf", file=str(self.png))
+        image = Image.fromFileSystem(str(self.png))
+        self.assertEqual(
+            outgoing_segments(
+                [Plain("a"), attachment, image, Plain("b")], images=False
+            ),
+            [
+                ("text", [("plain", "a")]),
+                ("file", attachment),
+                ("text", [("plain", "b")]),
+            ],
+        )
+        event = NativeWeChatEvent(self.source, self.adapter)
+        self.adapter.ensure_reply_allowed = AsyncMock()
+        self.adapter.send_file = AsyncMock()
+        self.adapter.send_text = AsyncMock()
+        await event.send(MessageChain([Plain("文件"), attachment]))
+        self.adapter.send_file.assert_awaited_once()
+        self.assertIs(self.adapter.send_file.await_args.args[1], attachment)
+        first_key = self.adapter.send_file.await_args.args[2]
+
+        async def stream():
+            yield MessageChain([attachment])
+
+        await event.send_streaming(stream())
+        self.assertEqual(self.adapter.send_file.await_count, 2)
+        self.assertNotEqual(self.adapter.send_file.await_args.args[2], first_key)
+
+    async def test_proactive_file_chain_uses_group_and_friend_admission(self):
+        self.adapter.proactive_messages = True
+        self.adapter.thread_kinds["wxid_friend"] = ("direct", time.monotonic() + 3600)
+        self.adapter.send_file = AsyncMock()
+        attachment = File(name="report.pdf", file=str(self.png))
+        for thread, message_type in (
+            ("123@chatroom", MessageType.GROUP_MESSAGE),
+            ("wxid_friend", MessageType.FRIEND_MESSAGE),
+        ):
+            session = SimpleNamespace(session_id=thread, message_type=message_type)
+            await self.adapter.send_by_session(session, MessageChain([attachment]))
+            self.assertEqual(
+                self.adapter.send_file.await_args.args[:2], (thread, attachment)
+            )
+
     async def test_follow_up_only_shortly_after_a_mention(self):
         session = SimpleNamespace(
             session_id="123@chatroom", message_type=MessageType.GROUP_MESSAGE
@@ -622,6 +721,7 @@ class IncomingMediaTests(unittest.IsolatedAsyncioTestCase):
         }
         self.adapter = NativeWeChatAdapter(self.config, {}, asyncio.Queue())
         self.adapter.own_id = "wxid_bot"
+        self.adapter.file_dir = Path(self.temp.name) / "files"
         base = {
             "accountId": "account-test",
             "threadId": "123@chatroom",
@@ -634,6 +734,12 @@ class IncomingMediaTests(unittest.IsolatedAsyncioTestCase):
         self.image = base | {"id": "img1", "type": 3, "serverId": "999"}
         self.voice = base | {"id": "voice1", "type": 34}
         self.sticker = base | {"id": "st1", "type": 47}
+        self.file = base | {
+            "id": "file1",
+            "type": 49,
+            "appMessageType": 6,
+            "serverId": "888",
+        }
         self.ask = base | {
             "id": "ask1",
             "type": 1,
@@ -850,45 +956,279 @@ class IncomingMediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed.message[0].text, "[图片]（未能获取）")
 
     def test_recent_image_is_attached_once_within_window(self):
-        self.adapter.remember_image(self.image)
+        self.adapter.remember_attachment(self.image)
         ask = self.adapter.convert(self.ask, "live")
-        self.assertEqual(self.adapter.referenced_image(ask), "img1")
-        self.assertIsNone(self.adapter.referenced_image(ask))
-        self.adapter.remember_image(self.image)
+        self.assertEqual(self.adapter.referenced_attachment(ask), ("image", "img1"))
+        self.assertIsNone(self.adapter.referenced_attachment(ask))
+        self.adapter.remember_attachment(self.image)
         other = self.adapter.convert(self.ask | {"senderId": "wxid_x"}, "live")
-        self.assertIsNone(self.adapter.referenced_image(other))
+        self.assertIsNone(self.adapter.referenced_attachment(other))
         key = ("123@chatroom", "wxid_person")
-        self.adapter.recent_images[key] = (time.monotonic() - 500, "img1")
-        self.assertIsNone(self.adapter.referenced_image(ask))
+        self.adapter.recent_attachments[key] = (time.monotonic() - 500, "image", "img1")
+        self.assertIsNone(self.adapter.referenced_attachment(ask))
         context = self.adapter.convert(
             self.ask | {"mentions": {"state": "known", "self": False}}, "live", False
         )
-        self.adapter.remember_image(self.image)
-        self.assertIsNone(self.adapter.referenced_image(context))
+        self.adapter.remember_attachment(self.image)
+        self.assertIsNone(self.adapter.referenced_attachment(context))
 
     def test_quoted_image_is_found_by_server_id(self):
-        self.adapter.remember_image(self.image | {"senderId": "wxid_other"})
+        self.adapter.remember_attachment(self.image | {"senderId": "wxid_other"})
         quote = self.adapter.convert(self.quote, "live")
-        self.assertEqual(self.adapter.referenced_image(quote), "img1")
+        self.assertEqual(self.adapter.referenced_attachment(quote), ("image", "img1"))
         unknown = self.adapter.convert(
             self.quote | {"quote": self.quote["quote"] | {"serverId": "1"}}, "live"
         )
-        self.assertIsNone(self.adapter.referenced_image(unknown))
+        self.assertIsNone(self.adapter.referenced_attachment(unknown))
 
     async def test_finish_and_commit_appends_image_and_always_dispatches(self):
         png = Path(self.temp.name) / "x.png"
         png.write_bytes(PNG_1X1)
         self.adapter.download_media = AsyncMock(return_value=png)
         ask = self.adapter.convert(self.ask, "live")
-        await self.adapter.finish_and_commit(ask, "img1")
+        await self.adapter.finish_and_commit(ask, ("image", "img1"))
         event = self.adapter._event_queue.get_nowait()
         self.assertIsInstance(event.message_obj.message[0], At)
         self.assertIsInstance(event.message_obj.message[-1], Image)
         self.assertIn("123@chatroom", self.adapter.recent_mentions)
         self.adapter.download_media = AsyncMock(side_effect=OSError("disk"))
         ask = self.adapter.convert(self.ask | {"id": "ask2"}, "live")
-        await self.adapter.finish_and_commit(ask, "img1")
+        await self.adapter.finish_and_commit(ask, ("image", "img1"))
         self.assertEqual(self.adapter._event_queue.qsize(), 1)
+
+    def quoted_file_message(self):
+        return self.adapter.convert(
+            self.quote
+            | {
+                "quote": {
+                    "type": 49,
+                    "appMessageType": 6,
+                    "serverId": "888",
+                    "senderId": "wxid_person",
+                }
+            },
+            "live",
+        )
+
+    async def test_quoted_file_is_found_in_paged_history_after_restart(self):
+        message = self.quoted_file_message()
+        self.adapter.request = AsyncMock(
+            side_effect=[
+                {"items": [], "nextCursor": "a/b+="},
+                {"items": [self.file]},
+            ]
+        )
+        self.assertEqual(
+            await self.adapter.resolve_quoted_file(message), ("file", "file1")
+        )
+        self.assertIn("cursor=a%2Fb%2B%3D", self.adapter.request.await_args.args[1])
+        self.assertEqual(self.adapter.referenced_attachment(message), ("file", "file1"))
+
+    async def test_quote_rejects_recalled_mismatched_and_other_chat_files(self):
+        message = self.quoted_file_message()
+        for change in (
+            {"recall": {"state": "recalled"}},
+            {"senderId": "other"},
+            {"direction": "outgoing"},
+            {"appMessageType": 74},
+        ):
+            self.adapter.request = AsyncMock(
+                return_value={"items": [self.file | change]}
+            )
+            self.assertIsNone(await self.adapter.resolve_quoted_file(message))
+        for change in ({"threadId": "other@chatroom"}, {"accountId": "other"}):
+            self.adapter.request = AsyncMock(
+                return_value={"items": [self.file | change]}
+            )
+            with self.assertRaises(RuntimeError):
+                await self.adapter.resolve_quoted_file(message)
+
+    async def test_missing_quoted_file_never_uses_an_unrelated_recent_attachment(self):
+        self.adapter.remember_attachment(self.image)
+        message = self.quoted_file_message()
+        self.assertIsNone(self.adapter.referenced_attachment(message))
+        self.adapter.request = AsyncMock(return_value={"items": []})
+        await self.adapter.finish_and_commit(message)
+        event = self.adapter._event_queue.get_nowait()
+        self.assertIn("引用文件未能获取", event.message_str)
+        self.assertFalse(any(isinstance(c, File) for c in event.message_obj.message))
+
+    async def test_old_quoted_file_is_attached_through_normal_dispatch(self):
+        message = self.quoted_file_message()
+        self.adapter.request = AsyncMock(return_value={"items": [self.file]})
+        path = Path(self.temp.name) / "report.pdf"
+        path.write_bytes(b"%PDF-test")
+        self.adapter.download_media = AsyncMock(return_value=path)
+        await self.adapter.finish_and_commit(message)
+        event = self.adapter._event_queue.get_nowait()
+        self.assertIsInstance(event.message_obj.message[-1], File)
+        self.adapter.download_media.assert_awaited_once_with("file1", "file", wait=60)
+
+    def test_file_admission_preserves_group_and_friend_rules(self):
+        self.assertIsNone(self.adapter.convert(self.file, "live"))
+        context = self.adapter.convert(self.file, "live", False)
+        self.assertEqual(context.wechat_kind, "file")
+        self.assertFalse(self.adapter.is_directed(context))
+        private = self.file | {"threadId": "wxid_person"}
+        self.adapter.thread_kinds["wxid_person"] = ("direct", time.monotonic() + 3600)
+        message = self.adapter.convert(private, "live")
+        self.assertEqual(message.wechat_kind, "file")
+        self.assertTrue(self.adapter.is_directed(message))
+        self.assertIsNone(self.adapter.convert(private, "history"))
+        self.assertIsNone(
+            self.adapter.convert(private | {"appMessageType": 74}, "live")
+        )
+        self.adapter.receive_media = False
+        self.assertIsNone(self.adapter.convert(private, "live"))
+
+    async def test_file_download_starts_one_job_and_preserves_bytes_and_name(self):
+        asset = {
+            "id": "f1",
+            "accountId": "account-test",
+            "messageId": "file1",
+            "kind": "file",
+            "variant": "original",
+            "state": "pending",
+            "filename": "报告.pdf",
+            "advertisedByteLength": 5,
+        }
+        self.adapter.request = AsyncMock(
+            side_effect=[
+                {"items": [asset]},
+                {"id": "job1", "state": "queued"},
+                {"items": [asset | {"jobId": "job1"}]},
+                {
+                    "items": [
+                        asset
+                        | {
+                            "state": "available",
+                            "byteLength": 5,
+                            "sha256": hashlib.sha256(b"%PDF-").hexdigest(),
+                        }
+                    ]
+                },
+            ]
+        )
+        self.adapter.request_bytes = AsyncMock(return_value=b"%PDF-")
+        with patch("main.asyncio.sleep", new_callable=AsyncMock):
+            path = await self.adapter.download_media("file1", "file")
+        self.assertEqual(path.read_bytes(), b"%PDF-")
+        self.assertTrue(path.name.endswith("报告.pdf"))
+        self.assertEqual(path.parent, self.adapter.file_dir)
+        self.adapter.request_bytes.assert_awaited_once_with(
+            "/media/f1/content", FILE_MAX_BYTES
+        )
+        posts = [c for c in self.adapter.request.await_args_list if c.args[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0].args[1], "/messages/file1/media-transfers")
+        self.assertEqual(posts[0].kwargs["json"]["assetId"], "f1")
+
+    async def test_failed_expired_and_oversized_files_do_not_start_downloads(self):
+        asset = {"id": "f", "kind": "file", "variant": "original"}
+        for change in (
+            {"state": "failed"},
+            {"state": "expired"},
+            {"state": "pending", "advertisedByteLength": FILE_MAX_BYTES + 1},
+            {"state": "available", "byteLength": FILE_MAX_BYTES + 1},
+        ):
+            with self.subTest(change=change):
+                self.adapter.request = AsyncMock(
+                    return_value={"items": [asset | change]}
+                )
+                self.adapter.request_bytes = AsyncMock()
+                self.assertIsNone(await self.adapter.download_media("file1", "file"))
+                self.adapter.request.assert_awaited_once()
+                self.adapter.request_bytes.assert_not_awaited()
+
+    async def test_file_identity_mismatch_is_rejected(self):
+        for change in ({"accountId": "other"}, {"messageId": "other"}):
+            self.adapter.request = AsyncMock(
+                return_value={
+                    "items": [
+                        {
+                            "id": "f",
+                            "kind": "file",
+                            "variant": "original",
+                            "state": "available",
+                            **change,
+                        }
+                    ]
+                }
+            )
+            self.adapter.request_bytes = AsyncMock()
+            with self.assertRaises(RuntimeError):
+                await self.adapter.download_media("file1", "file")
+            self.adapter.request_bytes.assert_not_awaited()
+
+    async def test_file_filename_is_safe_and_truncated_files_are_rejected(self):
+        self.adapter.request_bytes = AsyncMock(return_value=b"document")
+        asset = {"id": "f", "filename": "..\\../../报告.pdf", "byteLength": 8}
+        path = await self.adapter.save_asset(asset, "file")
+        self.assertEqual(path.parent.resolve(), self.adapter.file_dir.resolve())
+        self.assertTrue(path.name.endswith("报告.pdf"))
+        self.assertEqual(path.read_bytes(), b"document")
+        self.assertIsNone(
+            await self.adapter.save_asset(asset | {"byteLength": 9}, "file")
+        )
+        self.assertIsNone(
+            await self.adapter.save_asset(asset | {"sha256": "bad"}, "file")
+        )
+
+    async def test_private_file_dispatches_file_component_or_failure_status(self):
+        private = self.file | {"threadId": "wxid_person"}
+        self.adapter.thread_kinds["wxid_person"] = ("direct", time.monotonic() + 3600)
+        path = Path(self.temp.name) / ("file-" + "a" * 24 + "-报告.pdf")
+        path.write_bytes(b"document")
+        self.adapter.download_media = AsyncMock(return_value=path)
+        message = self.adapter.convert(private, "live")
+        await self.adapter.finish_and_commit(message)
+        event = self.adapter._event_queue.get_nowait()
+        component = event.message_obj.message[1]
+        self.assertIsInstance(component, File)
+        self.assertEqual(component.name, "报告.pdf")
+        self.assertEqual(await component.get_file(), str(path.resolve()))
+        self.assertEqual(event.message_str, "[文件：报告.pdf]")
+        self.adapter.download_media = AsyncMock(return_value=None)
+        message = self.adapter.convert(private, "live")
+        await self.adapter.finish_and_commit(message)
+        event = self.adapter._event_queue.get_nowait()
+        self.assertEqual(event.message_str, "[文件]（未能获取）")
+        self.assertFalse(any(isinstance(c, File) for c in event.message_obj.message))
+        self.adapter.download_media = AsyncMock(side_effect=OSError("disk"))
+        await self.adapter.finish_and_commit(self.adapter.convert(private, "live"))
+        self.assertEqual(
+            self.adapter._event_queue.get_nowait().message_str, "[文件]（未能获取）"
+        )
+
+    def test_private_file_accompanies_next_question_within_window(self):
+        self.adapter.thread_kinds["wxid_person"] = ("direct", time.monotonic() + 3600)
+        self.adapter.remember_attachment(self.file | {"threadId": "wxid_person"})
+        ask = self.adapter.convert(self.ask | {"threadId": "wxid_person"}, "live")
+        self.assertEqual(self.adapter.referenced_attachment(ask), ("file", "file1"))
+        self.assertIsNone(self.adapter.referenced_attachment(ask))
+
+    async def test_group_file_is_attached_to_next_at_once_and_quotes_stay_in_chat(self):
+        self.adapter.remember_attachment(self.file)
+        ask = self.adapter.convert(self.ask, "live")
+        ref = self.adapter.referenced_attachment(ask)
+        self.assertEqual(ref, ("file", "file1"))
+        self.assertIsNone(self.adapter.referenced_attachment(ask))
+        path = Path(self.temp.name) / "report.pdf"
+        path.write_bytes(b"document")
+        self.adapter.download_media = AsyncMock(return_value=path)
+        await self.adapter.finish_and_commit(ask, ref)
+        self.assertIsInstance(
+            self.adapter._event_queue.get_nowait().message_obj.message[-1], File
+        )
+        quote = self.adapter.convert(
+            self.quote | {"quote": {"type": 49, "serverId": "888"}}, "live"
+        )
+        self.assertEqual(self.adapter.referenced_attachment(quote), ("file", "file1"))
+        quote.raw_message["threadId"] = "other@chatroom"
+        self.assertIsNone(self.adapter.referenced_attachment(quote))
+        self.adapter.remember_attachment(self.file)
+        self.adapter.file_attach_window = 0
+        self.assertIsNone(self.adapter.referenced_attachment(ask))
 
 
 class ProactiveAndMentionTests(unittest.IsolatedAsyncioTestCase):
