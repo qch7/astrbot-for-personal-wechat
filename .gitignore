@@ -11,6 +11,8 @@ data/
 *.sqlite*
 *.log
 *.png
+# The plugin/platform logo is the only tracked image (QR codes stay ignored).
+!/logo.png
 *.jpg
 *.zip
 *.tgz

@@ -93,7 +93,7 @@ python3 scripts/install_plugin.py \
 
 重新启动 AstrBot。插件首次加载时，给未绑定独立配置的目标群创建独立配置，清空该群额外的模型唤醒前缀并设置指定模型。如果目标群已匹配其他配置，插件会保留它；请在 AstrBot WebUI 中检查该配置的模型和唤醒设置。
 
-手动安装时，把根目录的 `main.py`、`panel.py`、`metadata.yaml`、`requirements.txt`、`_conf_schema.json` 以及 `views/`、`.astrbot-plugin/` 两个目录放进 `data/plugins/astrbot_plugin_native_wechat/`，再按 [示例](../examples/platform.example.json) 追加平台配置。`chat_provider_id` 是必填项。
+手动安装时，把根目录的 `main.py`、`panel.py`、`metadata.yaml`、`logo.png`、`requirements.txt`、`_conf_schema.json` 以及 `views/`、`.astrbot-plugin/` 两个目录放进 `data/plugins/astrbot_plugin_native_wechat/`，再按 [示例](../examples/platform.example.json) 追加平台配置。`chat_provider_id` 是必填项。
 
 ## 6. 验证收发
 
@@ -120,6 +120,6 @@ bash scripts/wx --account astrbot-test --json account status
 
 ## 0.2.0 升级与群人格设置
 
-备份现有插件目录，将 `main.py`、`panel.py`、`metadata.yaml`、`requirements.txt`、`_conf_schema.json` 和 `views/`、`.astrbot-plugin/` 目录（0.9 起的管理面板）一并复制到插件目录，然后重启 AstrBot 并刷新管理页面。运行配置和密钥不放入插件源码。
+备份现有插件目录，将 `main.py`、`panel.py`、`metadata.yaml`、`logo.png`、`requirements.txt`、`_conf_schema.json` 和 `views/`、`.astrbot-plugin/` 目录（0.9 起的管理面板）一并复制到插件目录，然后重启 AstrBot 并刷新管理页面。运行配置和密钥不放入插件源码。
 
 在“插件 → AstrBot for Personal WeChat → 配置 → 微信群人格”中按群名选择人格。保留“切换人格时开始新对话”可避免旧上下文影响，旧会话仍保留。日常保存会自动重载插件。群名在启动或保存时刷新，暂时读取失败不影响既有绑定。详细步骤见 [README](../README.md#按群选择人格020)。

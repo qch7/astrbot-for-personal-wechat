@@ -441,5 +441,22 @@ class RuntimeHookTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("checked_at", entry)
 
 
+class LogoTests(unittest.TestCase):
+    def test_adapter_registers_a_square_png_logo(self):
+        from astrbot.core.platform.register import platform_registry
+
+        import main
+
+        metadata = [p for p in platform_registry if p.name == "native_wechat"]
+        self.assertEqual(len(metadata), 1)
+        self.assertEqual(metadata[0].logo_path, "logo.png")
+        # AstrBot resolves logo_path next to the adapter's module file.
+        logo = Path(main.__file__).with_name("logo.png").read_bytes()
+        self.assertTrue(logo.startswith(b"\x89PNG\r\n\x1a\n"))
+        width = int.from_bytes(logo[16:20], "big")
+        height = int.from_bytes(logo[20:24], "big")
+        self.assertEqual(width, height)
+
+
 if __name__ == "__main__":
     unittest.main()

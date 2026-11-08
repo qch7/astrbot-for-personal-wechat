@@ -272,6 +272,8 @@ class NativeWeChatEvent(AstrMessageEvent):
         "allowed_friends": [],
     },
     adapter_display_name="本机个人微信",
+    # Shown in the WebUI robot list; the same file is the plugin's logo.
+    logo_path="logo.png",
     support_streaming_message=False,
 )
 class NativeWeChatAdapter(Platform):
@@ -1430,7 +1432,7 @@ class NativeWeChatAdapter(Platform):
     "astrbot_plugin_native_wechat",
     "shuizhaodemumu",
     "本机微信指定群及好友接入",
-    "0.9.0",
+    "0.9.1",
 )
 class NativeWeChatPlugin(Star):
     def __init__(self, context, config=None):
