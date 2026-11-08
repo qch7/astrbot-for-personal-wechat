@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>微信管理面板</title>
+    <link rel="stylesheet" href="./style.css" />
+    <script src="/api/plugin/page/bridge-sdk.js"></script>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <path d="M9.2 4C5.2 4 2 6.7 2 10.1c0 1.9 1 3.6 2.6 4.7L4 17l2.6-1.3c.8.2 1.7.4 2.6.4h.5a5.2 5.2 0 0 1-.2-1.5c0-3.3 3.1-5.9 7-5.9h.4C16.2 6.1 13 4 9.2 4Zm-2.4 3.4a.9.9 0 1 1 0 1.8.9.9 0 0 1 0-1.8Zm4.9 0a.9.9 0 1 1 0 1.8.9.9 0 0 1 0-1.8ZM16.5 10C13.5 10 11 12.1 11 14.6s2.5 4.6 5.5 4.6c.7 0 1.3-.1 1.9-.3L20.5 20l-.5-1.8c1.2-.9 2-2.1 2-3.6 0-2.5-2.5-4.6-5.5-4.6Zm-1.9 2.6a.7.7 0 1 1 0 1.4.7.7 0 0 1 0-1.4Zm3.8 0a.7.7 0 1 1 0 1.4.7.7 0 0 1 0-1.4Z" />
+            </svg>
+          </div>
+          <div class="brand-name">个人微信<small>管理面板</small></div>
+        </div>
+        <button class="nav-item active" data-page="dashboard">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5" /><rect x="14" y="3" width="7" height="5" rx="1.5" /><rect x="14" y="12" width="7" height="9" rx="1.5" /><rect x="3" y="16" width="7" height="5" rx="1.5" /></svg>
+          仪表盘
+        </button>
+        <button class="nav-item" data-page="login">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><path d="M14 14h3v3h-3zM20 14v.01M14 20h.01M17 20h4v-3" /></svg>
+          登录管理
+        </button>
+        <button class="nav-item" data-page="chats">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1.1-4.6A8 8 0 1 1 21 12Z" /></svg>
+          会话与通讯录
+        </button>
+        <button class="nav-item" data-page="logs">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h10" /></svg>
+          日志与事件
+        </button>
+        <div class="sidebar-foot" id="foot-version"></div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <h1 id="page-title">仪表盘</h1>
+          <span class="pill" id="top-status">读取中</span>
+          <div class="spacer"></div>
+          <select class="input" id="platform-select" hidden aria-label="微信平台"></select>
+          <button class="btn small" id="refresh-btn" title="立即刷新">刷新</button>
+        </header>
+
+        <section class="page active" id="page-dashboard">
+          <div id="dash-banner"></div>
+          <div class="card">
+            <div class="hero">
+              <div class="avatar" id="bot-avatar">微</div>
+              <div class="hero-body">
+                <div class="hero-name"><span id="bot-name">—</span><span class="pill" id="bot-status">—</span></div>
+                <div class="hero-sub" id="bot-sub">—</div>
+              </div>
+              <div class="hero-actions">
+                <button class="btn primary" data-goto="login">登录管理</button>
+              </div>
+            </div>
+          </div>
+          <div class="grid cols-4 section">
+            <div class="card"><div class="stat-label">今日收到</div><div class="stat-value" id="stat-recv">—</div><div class="stat-foot" id="stat-recv-foot">—</div></div>
+            <div class="card"><div class="stat-label">今日发出</div><div class="stat-value" id="stat-sent">—</div><div class="stat-foot" id="stat-sent-foot">—</div></div>
+            <div class="card"><div class="stat-label">最后收到消息</div><div class="stat-value" id="stat-last-recv">—</div><div class="stat-foot" id="stat-last-recv-foot">—</div></div>
+            <div class="card"><div class="stat-label">最后发出消息</div><div class="stat-value" id="stat-last-sent">—</div><div class="stat-foot" id="stat-last-sent-foot">—</div></div>
+          </div>
+          <div class="grid cols-2 section">
+            <div class="card">
+              <h2>掉线提醒<span class="hint" id="alert-hint"></span></h2>
+              <dl class="kv" id="alert-kv"></dl>
+            </div>
+            <div class="card">
+              <h2>运行环境</h2>
+              <dl class="kv" id="env-kv"></dl>
+            </div>
+          </div>
+          <div class="card section">
+            <h2>回复范围<span class="hint">在 AstrBot「平台配置」里修改</span></h2>
+            <dl class="kv" id="policy-kv"></dl>
+          </div>
+        </section>
+
+        <section class="page" id="page-login">
+          <div class="card">
+            <h2>当前状态</h2>
+            <div class="row" id="login-current"></div>
+          </div>
+          <div class="card section">
+            <h2>重新登录<span class="hint">二维码与确认请求 5 分钟内有效</span></h2>
+            <div class="callout warn" style="margin-bottom: 12px">
+              请在<strong>登录着机器人小号</strong>的手机上操作，<span id="login-own-hint"></span>不要用个人号扫码，否则桥接会登录到错误的账号。
+            </div>
+            <div class="login-options">
+              <button class="btn big" id="login-saved">设备确认登录<span>手机微信会弹出“登录确认”，点确认即可；不行再用扫码</span></button>
+              <button class="btn big primary" id="login-qr">扫码登录<span>生成二维码，用机器人小号的微信“扫一扫”</span></button>
+            </div>
+            <div class="section" id="attempt-area" hidden>
+              <div class="attempt">
+                <div class="qr-box" id="qr-box"><span class="muted">等待二维码…</span></div>
+                <div>
+                  <ol class="steps" id="attempt-steps"></ol>
+                  <div id="attempt-detail" class="muted"></div>
+                  <div class="row section">
+                    <button class="btn danger small" id="attempt-cancel">取消这次登录</button>
+                    <button class="btn small" id="attempt-close" hidden>关闭</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="card section">
+            <h2>连接控制</h2>
+            <div class="row">
+              <button class="btn" id="conn-connect">重新连接</button>
+              <button class="btn" id="conn-disconnect">断开连接</button>
+              <button class="btn danger" id="conn-logout">退出登录…</button>
+            </div>
+            <p class="muted" style="margin: 10px 0 0; font-size: 12.5px">
+              “断开连接”保留登录状态，随时可以重新连接；“退出登录”会注销桥接上的小号并关闭自动重连，之后必须重新扫码。
+            </p>
+          </div>
+        </section>
+
+        <section class="page" id="page-chats">
+          <div class="toolbar">
+            <div class="chips" id="chat-tabs">
+              <button class="chip active" data-tab="threads">会话</button>
+              <button class="chip" data-tab="contacts">通讯录</button>
+            </div>
+          </div>
+          <div id="chat-threads" class="card">
+            <div class="toolbar">
+              <div class="chips" id="thread-filter">
+                <button class="chip active" data-filter="all">全部</button>
+                <button class="chip" data-filter="group">群聊</button>
+                <button class="chip" data-filter="direct">私聊</button>
+                <button class="chip" data-filter="permitted">可回复</button>
+              </div>
+              <input class="input" id="thread-search" placeholder="按名称筛选" />
+              <div class="spacer" style="flex: 1"></div>
+              <button class="btn small" id="thread-reload">重新加载</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>会话</th><th>类型</th><th>最后一条消息</th><th>未读</th><th>机器人回复</th><th></th></tr></thead>
+                <tbody id="thread-body"></tbody>
+              </table>
+            </div>
+            <div class="row section" id="thread-more-row" hidden><button class="btn small" id="thread-more">加载更多</button></div>
+          </div>
+          <div id="chat-contacts" class="card" hidden>
+            <div class="toolbar">
+              <input class="input" id="contact-search" placeholder="搜索昵称、备注或微信号" style="flex: 1; max-width: 360px" />
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>联系人</th><th>微信号</th><th>类别</th></tr></thead>
+                <tbody id="contact-body"></tbody>
+              </table>
+            </div>
+            <div class="row section" id="contact-more-row" hidden><button class="btn small" id="contact-more">加载更多</button></div>
+          </div>
+        </section>
+
+        <section class="page" id="page-logs">
+          <div class="toolbar">
+            <div class="chips" id="log-tabs">
+              <button class="chip active" data-tab="plugin">插件日志</button>
+              <button class="chip" data-tab="events">桥接事件</button>
+            </div>
+            <div class="spacer" style="flex: 1"></div>
+            <label class="row muted" id="log-level-wrap"><input type="checkbox" id="log-warn-only" /> 只看警告和错误</label>
+            <label class="row muted" id="event-all-wrap" hidden><input type="checkbox" id="event-all" /> 显示全部事件</label>
+            <button class="btn small" id="log-pause">暂停</button>
+          </div>
+          <div class="card">
+            <div class="log-view" id="log-view"></div>
+            <div class="log-view" id="event-view" hidden></div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <div class="toasts" id="toasts"></div>
+    <script src="./app.js"></script>
+  </body>
+</html>

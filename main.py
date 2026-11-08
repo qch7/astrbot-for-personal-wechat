@@ -3,7 +3,8 @@
 # Modified 2026 by qch7 (fork): group context messages, member nicknames,
 # per-group whitelist/profile defaults, bot-offline alerts, image replies,
 # @-mentioning the asker, WeChat reply-style hints, incoming images/voice,
-# quote replies, incoming files and private chats with friends.
+# quote replies, incoming files, private chats with friends and a WebUI
+# management panel (panel.py, views/panel).
 
 import asyncio
 import copy
@@ -34,6 +35,29 @@ from astrbot.api.platform import (
 from astrbot.api.star import Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 from astrbot.core.utils.session_lock import session_lock_manager
+
+try:  # Loaded as a package inside AstrBot; tests import main as a module.
+    from .panel import (
+        LogBuffer,
+        WeChatPanel,
+        note_error,
+        note_poll,
+        note_received,
+        note_sent,
+        register_adapter,
+        unregister_adapter,
+    )
+except ImportError:
+    from panel import (
+        LogBuffer,
+        WeChatPanel,
+        note_error,
+        note_poll,
+        note_received,
+        note_sent,
+        register_adapter,
+        unregister_adapter,
+    )
 
 LOCAL_BRIDGE = "http://127.0.0.1:6174"
 MEMBER_NAME_TTL = 3600
@@ -514,6 +538,8 @@ class NativeWeChatAdapter(Platform):
             timeout=aiohttp.ClientTimeout(total=30),
             trust_env=False,
         )
+        platform_id = self.config.get("id", "")
+        register_adapter(platform_id, self)
         try:
             while True:
                 try:
@@ -537,6 +563,7 @@ class NativeWeChatAdapter(Platform):
                     page = await self.request(
                         "GET", f"/events?after={self.cursor}&limit=100"
                     )
+                    note_poll(platform_id)
                     for event in page["items"]:
                         message = None
                         data = event.get("data", {})
@@ -617,14 +644,17 @@ class NativeWeChatAdapter(Platform):
                     OSError,
                 ) as exc:
                     logger.error("Native WeChat receive failed: %s", str(exc))
+                    note_error(platform_id, exc)
                     await asyncio.sleep(5)
         finally:
+            unregister_adapter(platform_id, self)
             for task in list(self.tasks):
                 task.cancel()
             await self.http.close()
 
     def dispatch(self, message):
         self.commit_event(NativeWeChatEvent(message, self))
+        note_received(self.config.get("id", ""))
         if message.type == MessageType.FRIEND_MESSAGE:
             self.recent_mentions[message.session_id] = (time.monotonic(), message)
             logger.info("Native WeChat admitted one private message")
@@ -1157,6 +1187,7 @@ class NativeWeChatAdapter(Platform):
             raise RuntimeError(
                 "WeChat delivery is unconfirmed; do not automatically resend"
             )
+        note_sent(self.config.get("id", ""))
 
     async def send_image(self, group, image, key):
         """Upload one image to the bridge and send it to an allowed thread."""
@@ -1224,6 +1255,7 @@ class NativeWeChatAdapter(Platform):
                 f"WeChat {kind} delivery is unconfirmed ({job.get('state')}); "
                 "do not automatically resend"
             )
+        note_sent(self.config.get("id", ""))
 
     async def member_name(self, group, username):
         """Resolve a member's group nickname, falling back to the WeChat ID.
@@ -1398,16 +1430,25 @@ class NativeWeChatAdapter(Platform):
     "astrbot_plugin_native_wechat",
     "shuizhaodemumu",
     "本机微信指定群及好友接入",
-    "0.8.1",
+    "0.9.0",
 )
 class NativeWeChatPlugin(Star):
     def __init__(self, context, config=None):
         super().__init__(context, config)
         self.config = config if config is not None else {}
         self.watch_task = None
+        # Offline-alert tracking per platform ID, also shown in the panel.
+        self.alert_state = {}
+        self.panel_logs = LogBuffer()
+        self.panel = WeChatPanel(self, self.panel_logs)
+        try:
+            self.panel.register(context)
+        except Exception as exc:  # the adapter must work without its panel
+            logger.error("Could not register the WeChat panel: %s", str(exc))
 
     async def initialize(self):
         """Discover allowed groups, apply their personas and start offline alerts."""
+        self.panel_logs.attach()
         await self.configure_groups()
         platforms = [
             p
@@ -1424,6 +1465,7 @@ class NativeWeChatPlugin(Star):
         if self.watch_task:
             self.watch_task.cancel()
             self.watch_task = None
+        self.panel_logs.detach()
 
     @event_filter.on_llm_response()
     async def deliver_cron_result(self, event, resp):
@@ -1706,6 +1748,7 @@ class NativeWeChatPlugin(Star):
         for platform in platforms:
             entry = state.setdefault(platform["id"], {"since": None, "alerted": False})
             online, detail = await self.account_status(platform)
+            entry.update(detail=detail, checked_at=time.time())
             if online:
                 if entry["alerted"]:
                     await self.alert(f"✅ 微信机器人（{platform['id']}）已恢复在线。")
@@ -1721,7 +1764,8 @@ class NativeWeChatPlugin(Star):
                 )
 
     async def watch_accounts(self, platforms):
-        state = {}
+        state = self.alert_state
+        state.clear()
         while True:
             try:
                 await self.check_accounts(platforms, state, time.monotonic())
