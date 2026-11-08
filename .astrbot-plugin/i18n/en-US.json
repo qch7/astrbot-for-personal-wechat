@@ -1,0 +1,8 @@
+{
+  "pages": {
+    "panel": {
+      "title": "WeChat panel",
+      "description": "Status, QR login, chats, logs and offline alerts"
+    }
+  }
+}

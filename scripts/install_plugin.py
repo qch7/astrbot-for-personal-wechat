@@ -70,8 +70,17 @@ def main():
             "AstrBot config changed during installation; stop AstrBot and retry"
         )
     target.mkdir(parents=True)
-    for name in ("main.py", "metadata.yaml", "requirements.txt", "_conf_schema.json"):
+    for name in (
+        "main.py",
+        "panel.py",
+        "metadata.yaml",
+        "requirements.txt",
+        "_conf_schema.json",
+    ):
         shutil.copy2(project / name, target / name)
+    # WebUI management panel page and its titles.
+    for folder in ("views", ".astrbot-plugin"):
+        shutil.copytree(project / folder, target / folder)
     temporary = config_path.with_suffix(".wechat.tmp")
     temporary.write_text(
         json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8-sig"
