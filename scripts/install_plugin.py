@@ -74,6 +74,7 @@ def main():
         "main.py",
         "panel.py",
         "metadata.yaml",
+        "logo.png",
         "requirements.txt",
         "_conf_schema.json",
     ):

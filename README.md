@@ -4,7 +4,7 @@
 
 这是一个社区实验性适配器，使用本机运行的 `agent-wechat` 原生服务；不是腾讯官方机器人接口，也不是 AstrBot 官方内置微信适配器。本仓库提供 Python 插件、配置辅助脚本和部署文档，不包含微信客户端、桥接二进制、账号资料或模型密钥。
 
-> **本仓库是 [shuizhaodemumu/astrbot-for-personal-wechat](https://github.com/shuizhaodemumu/astrbot-for-personal-wechat) 的 fork（0.9.0）**，在 0.2.0 基础上增加：
+> **本仓库是 [shuizhaodemumu/astrbot-for-personal-wechat](https://github.com/shuizhaodemumu/astrbot-for-personal-wechat) 的 fork（0.9.1）**，在 0.2.0 基础上增加：
 >
 > - **群聊上下文**：平台配置 `context_messages: true` 时，白名单群里没有 @ 的文字也交给 AstrBot，供「群聊上下文感知」记录；这些消息不带 At，不会唤醒模型，也永远不会被回复（插件会丢弃针对它们的回复）。以 `context_skip_prefixes`（默认 `["/"]`）开头的未 @ 文字不转发，群成员不能绕过 @ 执行指令。
 > - **群昵称**：`resolve_member_names`（默认开）从桥接读取群成员昵称作为发送者名称，查不到时退回微信 ID；结果缓存一小时。
@@ -19,7 +19,7 @@
 > - **Docker 部署**：见 [docs/DOCKER.md](docs/DOCKER.md)。
 > - **0.8 版本支持文件收发**。开启 `receive_media` 后，接收微信普通文件消息（type 49/subtype 6），按需下载，校验长度和 SHA-256，并交给 AstrBot 的 `File` 附件入口。好友私聊发文件即可触发处理。群文件作为上下文接收，随后同一发送者在 `attach_recent_file_seconds`（默认 120 秒）内 @ 机器人时会附上最近的图片或文件，也可以引用该群已接收的文件再 @。0.8.1 可从当前会话保存的最近 1000 条消息中查找被引用的原文件，支持重启后的旧文件引用。单文件收发上限为 50 MiB，最多等待下载 60 秒，失败会显示「文件未能获取」。文件保存在 AstrBot 临时目录中，保留经过路径清理的文件名，缓存保留一小时。AstrBot 的文件读取工具支持 PDF 文本、DOCX 等格式，内容解析使用该会话已有的工具与文件解析配置。回复或 `send_message_to_user` 中的 `File` 消息段会保留文件名上传并发送回原会话，普通回复、流式回复、定时任务均支持，并通过桥接任务回执确认结果。
 >
-> - **管理面板（0.9）**：在 AstrBot WebUI 的「插件」里打开本插件的「微信管理面板」（需要 AstrBot ≥ 4.28 的插件页面功能），可以查看小号在线状态、今日收发、掉线提醒状态，发起**设备确认登录**或**扫码登录**（二维码过期自动刷新，进度实时显示），重新连接、断开或退出登录，浏览群聊与私聊并标出机器人会回复的会话，搜索通讯录，向会回复的会话发测试消息，查看插件日志和桥接事件（掉线、被踢、登录步骤）。面板路由挂在 AstrBot 的插件 Web API 上，沿用 WebUI 登录鉴权；桥接令牌只在服务器端使用，浏览器只拿到汇总后的数据和二维码图片。实现见 `panel.py` 与 `views/panel/`。
+> - **管理面板（0.9）**：在 AstrBot WebUI 的「插件」里打开本插件的「微信管理面板」（需要 AstrBot ≥ 4.28 的插件页面功能），可以查看小号在线状态、今日收发、掉线提醒状态，发起**设备确认登录**或**扫码登录**（二维码过期自动刷新，进度实时显示），重新连接、断开或退出登录，浏览群聊与私聊并标出机器人会回复的会话，搜索通讯录，向会回复的会话发测试消息，查看插件日志和桥接事件（掉线、被踢、登录步骤）。面板路由挂在 AstrBot 的插件 Web API 上，沿用 WebUI 登录鉴权；桥接令牌只在服务器端使用，浏览器只拿到汇总后的数据和二维码图片。实现见 `panel.py` 与 `views/panel/`。0.9.1 起「机器人」列表和插件卡片显示微信图标（`logo.png`）。
 >
 > 安全提示：AstrBot 的本地代码执行（`computer_use_local_permissions`）如果对普通成员开放，任何群成员 @ 机器人、任何好友私聊机器人，都可能让它在 AstrBot 所在环境执行命令、读取包含 API key 和桥接令牌的配置文件。建议普通成员关闭执行并把文件范围限制为 `workspace`。
 
@@ -104,6 +104,7 @@ panel.py                      WebUI 管理面板的后端路由
 views/panel/                  WebUI 管理面板页面（原生 HTML/CSS/JS）
 .astrbot-plugin/i18n/         面板标题等界面文字
 metadata.yaml                 插件信息
+logo.png                      插件与平台图标
 _conf_schema.json             按群显示与人格选择界面
 requirements.txt              运行依赖
 scripts/setup_bridge.py       生成本机桥接配置
