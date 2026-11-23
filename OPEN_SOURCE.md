@@ -44,7 +44,7 @@ agent-wechat 的 [`THIRD_PARTY_NOTICES.txt`](https://github.com/thisnick/agent-w
 - [Citizen Lab / wechat-security-report](https://github.com/citizenlab/wechat-security-report)：MMTLS 测试向量，通知中标注 MIT 许可。
 - [kn007 / silk-v3-decoder](https://github.com/kn007/silk-v3-decoder)：SILK 相关源码，通知区分 MIT 包装项目与保留的 SDK 许可。
 
-这些属于桥接的间接来源，不是本插件直接实现或导入的功能。本项目当前只收发文字；上游通知也不能替代其整个项目的许可证。完整依赖与许可应查看上游发布物，不把本文件当作其完整软件物料清单。
+这些属于桥接的间接来源，不是本插件直接实现或导入的功能。本插件收发图片、语音和文件时只调用桥接的 HTTP 接口，不包含这些编解码实现；上游通知也不能替代其整个项目的许可证。完整依赖与许可应查看上游发布物，不把本文件当作其完整软件物料清单。
 
 ## 4. 开发工具与外部服务
 

@@ -1,6 +1,6 @@
 # Ubuntu 部署与运行
 
-本指南面向单机源码运行的 AstrBot，实测版本为 4.29.3 / Python 3.12。桥接固定运行在宿主机 `127.0.0.1:6174`。Docker 的 `127.0.0.1` 指向容器自己，本版本没有提供容器跨网络部署方案。
+本指南面向单机源码运行的 AstrBot，实测版本为 4.29.3 / Python 3.12。桥接固定运行在宿主机 `127.0.0.1:6174`。使用 AstrBot 官方 Docker 镜像时，请改看 [Docker 部署](DOCKER.md)。
 
 ## 1. 准备 AstrBot 和模型
 
@@ -11,7 +11,7 @@
 ## 2. 下载本项目并安装桥接
 
 ```bash
-git clone https://github.com/shuizhaodemumu/astrbot-for-personal-wechat.git
+git clone https://github.com/qch7/astrbot-for-personal-wechat.git
 cd astrbot-for-personal-wechat
 
 node --version
@@ -27,6 +27,8 @@ python3 scripts/setup_bridge.py
 bash scripts/wx --json daemon start
 bash scripts/wx --json daemon status
 ```
+
+这里的 1.1.0 是最初验证源码运行流程时的版本，只支持文字收发。图片、语音和文件功能需要 agent-wechat 1.3 及以上（实测 1.5.1，见 [Docker 部署](DOCKER.md)）；源码运行换用新版本时，请先对照上游发布说明核对安装步骤。
 
 `.runtime/` 被 Git 忽略。配置脚本以私有权限创建 `server.toml`、`client.toml` 和 `private/`，不会覆盖已有配置，也不会接管桌面微信资料。API 令牌由桥接启动时创建。
 
@@ -118,8 +120,8 @@ bash scripts/wx --account astrbot-test --json account status
 
 移除时，在 AstrBot 中删除对应平台和不再需要的独立群配置/路由，停止 AstrBot 后移走插件目录。运行数据和配置备份由操作者保管；安装脚本不会自动删除它们。
 
-## 0.2.0 升级与群人格设置
+## 升级插件
 
-备份现有插件目录，将 `main.py`、`panel.py`、`metadata.yaml`、`logo.png`、`requirements.txt`、`_conf_schema.json` 和 `views/`、`.astrbot-plugin/` 目录（0.9 起的管理面板）一并复制到插件目录，然后重启 AstrBot 并刷新管理页面。运行配置和密钥不放入插件源码。
+备份现有插件目录，将 `main.py`、`panel.py`、`metadata.yaml`、`logo.png`、`requirements.txt`、`_conf_schema.json` 和 `views/`、`.astrbot-plugin/` 目录一并复制到插件目录，然后重启 AstrBot 并刷新管理页面。运行配置和密钥不放入插件源码。升级前请阅读 [更新日志](../CHANGELOG.md) 中的升级注意事项，例如 0.7.0 起默认回复所有好友的私聊。
 
-在“插件 → AstrBot for Personal WeChat → 配置 → 微信群人格”中按群名选择人格。保留“切换人格时开始新对话”可避免旧上下文影响，旧会话仍保留。日常保存会自动重载插件。群名在启动或保存时刷新，暂时读取失败不影响既有绑定。详细步骤见 [README](../README.md#按群选择人格020)。
+群人格在「插件 → AstrBot for Personal WeChat → 配置 → 微信群人格」中按群名选择，见 [README](../README.md#按群选择人格)。

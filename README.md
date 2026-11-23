@@ -1,155 +1,152 @@
 # AstrBot for Personal WeChat
 
-让个人微信测试号通过指定微信群中的 **@消息** 或好友私聊接入 AstrBot，收发文字、图片和文件，并接收语音消息。
+让个人微信小号接入 [AstrBot](https://github.com/AstrBotDevs/AstrBot)：在指定微信群里被 **@** 时回复，与好友私聊，收发文字、图片、语音和文件，并在 AstrBot WebUI 里管理登录状态。
 
-这是一个社区实验性适配器，使用本机运行的 `agent-wechat` 原生服务；不是腾讯官方机器人接口，也不是 AstrBot 官方内置微信适配器。本仓库提供 Python 插件、配置辅助脚本和部署文档，不包含微信客户端、桥接二进制、账号资料或模型密钥。
+这是社区维护的实验性适配器，微信通信由本机运行的 [agent-wechat](https://github.com/thisnick/agent-wechat) 原生服务完成，插件只负责把它接到 AstrBot。它不是腾讯官方机器人接口，也不是 AstrBot 内置的微信适配器。本仓库只包含 Python 插件、辅助脚本和文档，不包含微信客户端、桥接程序、账号资料或模型密钥。
 
-> **本仓库是 [shuizhaodemumu/astrbot-for-personal-wechat](https://github.com/shuizhaodemumu/astrbot-for-personal-wechat) 的 fork（0.9.1）**，在 0.2.0 基础上增加：
->
-> - **群聊上下文**：平台配置 `context_messages: true` 时，白名单群里没有 @ 的文字也交给 AstrBot，供「群聊上下文感知」记录；这些消息不带 At，不会唤醒模型，也永远不会被回复（插件会丢弃针对它们的回复）。以 `context_skip_prefixes`（默认 `["/"]`）开头的未 @ 文字不转发，群成员不能绕过 @ 执行指令。
-> - **群昵称**：`resolve_member_names`（默认开）从桥接读取群成员昵称作为发送者名称，查不到时退回微信 ID；结果缓存一小时。
-> - **独立群配置的默认值**：若该群配置继承了 ID 白名单，自动把群会话加入白名单（否则 AstrBot 会静默拦截所有消息）；开启群聊上下文时关闭「主动回复」，并在新建群配置时打开「识别发送者」。
-> - **掉线提醒**：插件配置 `alert_sessions` 填 AstrBot 会话 ID（如 `qq:FriendMessage:12345`），小号退出登录或桥接不可达超过 `alert_after_seconds`（默认 120 秒）时发送提醒，恢复后再通知一次。
-> - **图片回复（0.4）**：回复中的图片经桥接上传后发送（需要 agent-wechat ≥ 1.3，实测 1.5.1）。`meme_manager` 等插件的补发只在该白名单群最近一次 @ 后 `proactive_window_seconds`（默认 120 秒）内放行，其余主动发送仍被拒绝。
-> - **回复体验（0.4）**：`mention_sender` 让回复 @ 提问者；`strip_markdown`（默认开）去掉微信会原样显示的 Markdown；插件配置 `reply_style_hint` 追加到微信群的模型请求，提示不用 Markdown、可用 `[旺柴]` 等微信表情代码、不用 `[微笑]`。
-> - **身份识别（0.4.1）**：`show_member_ids`（默认开）把成员显示为「昵称(wxid)」，昵称重名或冒充也能区分；消息 @ 了其他成员时附注被 @ 者；`text_mentions` 让手打的「@机器人群昵称」也算 @（微信只有从成员列表选择时才附带 @ 元数据）。
-> - **接收图片和语音（0.5）**：`receive_media`（默认开，需同时开启 `context_messages`）把群里的图片、语音作为群聊上下文交给 AstrBot：图片从桥接下载（优先 standard，原图仍在下载时最多等 15 秒，再退回缩略图），并校验大小与 SHA-256；语音是桥接解码好的 WAV，需要在该群配置里开启 AstrBot 的语音转文字（实测硅基流动 `FunAudioLLM/SenseVoiceSmall`，类型 OpenAI Whisper API）。动画表情记为「[动画表情]」。图片和语音无法 @，所以 @ 机器人时会附上被引用的图片，或提问者 `attach_recent_image_seconds`（默认 120 秒）内自己发的最后一张图（只附一次）。引用回复（type 49）现在当作文字处理，可以 @ 机器人，并注明引用了谁的什么内容。
-> - **主动消息与定时提醒（0.6）**：`proactive_messages: true` 时，任何主动发送（AstrBot 定时任务、插件、`send_message_to_user` 工具）都能发到白名单群，不限条数；平台随之声明支持主动消息，AstrBot 会把 `send_message_to_user` 提供给模型。消息链里的 At 组件（如 `mention_user`）会变成真正的微信 @。由群成员创建的定时任务，发出的第一段文字会自动 @ 创建者（消息里已 @ 他人、或创建者不是群成员时除外）。AstrBot 只投递定时任务里经 `send_message_to_user` 发出的内容，模型若只写了最终回复，插件会在 `on_llm_response` 中把这条回复补发到群里（去掉「任务完成、提醒已送达」之类的说明）。在群里 @ 机器人说「每天早上 8 点提醒我……」即可创建，需要开启 `provider_settings.proactive_capability.add_cron_tools`。个人号主动发消息越多，风控风险越高。
-> - **好友私聊（0.7）**：默认回复所有好友的私聊，不需要 @。只有桥接标记为 `direct` 的会话才算私聊，微信团队、公众号等系统会话一律忽略。平台配置 `friend_whitelist: true` 后只回复 `allowed_friends` 里的微信 ID（列表为空即关闭私聊）。插件为私聊建一个独立配置「微信 · 私聊」（路由 `<平台ID>:FriendMessage:*`，模型用 `chat_provider_id`，开启「识别发送者」），新建时关闭它从原配置继承的 ID 白名单，否则 AstrBot 会静默拦截所有好友；谁能私聊由上面两项决定。私聊里的文字、引用、图片、语音、动画表情都会单独回复，回复不 @ 对方；语音需要在这个配置里开启语音转文字。定时提醒和主动消息也能发到私聊。插件配置 `private_reply_style_hint` 是私聊用的风格提示。**从旧版本升级后，所有好友都能私聊机器人**；只想服务群的部署请设 `friend_whitelist: true` 并留空 `allowed_friends`。
-> - **Docker 部署**：见 [docs/DOCKER.md](docs/DOCKER.md)。
-> - **0.8 版本支持文件收发**。开启 `receive_media` 后，接收微信普通文件消息（type 49/subtype 6），按需下载，校验长度和 SHA-256，并交给 AstrBot 的 `File` 附件入口。好友私聊发文件即可触发处理。群文件作为上下文接收，随后同一发送者在 `attach_recent_file_seconds`（默认 120 秒）内 @ 机器人时会附上最近的图片或文件，也可以引用该群已接收的文件再 @。0.8.1 可从当前会话保存的最近 1000 条消息中查找被引用的原文件，支持重启后的旧文件引用。单文件收发上限为 50 MiB，最多等待下载 60 秒，失败会显示「文件未能获取」。文件保存在 AstrBot 临时目录中，保留经过路径清理的文件名，缓存保留一小时。AstrBot 的文件读取工具支持 PDF 文本、DOCX 等格式，内容解析使用该会话已有的工具与文件解析配置。回复或 `send_message_to_user` 中的 `File` 消息段会保留文件名上传并发送回原会话，普通回复、流式回复、定时任务均支持，并通过桥接任务回执确认结果。
->
-> - **管理面板（0.9）**：在 AstrBot WebUI 的「插件」里打开本插件的「微信管理面板」（需要 AstrBot ≥ 4.28 的插件页面功能），可以查看小号在线状态、今日收发、掉线提醒状态，发起**设备确认登录**或**扫码登录**（二维码过期自动刷新，进度实时显示），重新连接、断开或退出登录，浏览群聊与私聊并标出机器人会回复的会话，搜索通讯录，向会回复的会话发测试消息，查看插件日志和桥接事件（掉线、被踢、登录步骤）。面板路由挂在 AstrBot 的插件 Web API 上，沿用 WebUI 登录鉴权；桥接令牌只在服务器端使用，浏览器只拿到汇总后的数据和二维码图片。实现见 `panel.py` 与 `views/panel/`。0.9.1 起「机器人」列表和插件卡片显示微信图标（`logo.png`）。
->
-> 安全提示：AstrBot 的本地代码执行（`computer_use_local_permissions`）如果对普通成员开放，任何群成员 @ 机器人、任何好友私聊机器人，都可能让它在 AstrBot 所在环境执行命令、读取包含 API key 和桥接令牌的配置文件。建议普通成员关闭执行并把文件范围限制为 `workspace`。
+## 功能
+
+**群聊**
+
+- 只在白名单群里回复明确 @ 机器人的消息；其他群、@全体成员、自己发的消息和历史回放一律忽略。
+- 可选的群聊上下文：没有 @ 的群消息也交给 AstrBot 记录，但永远不会被回复，也不能用来执行指令。
+- 成员显示为「群昵称(微信 ID)」，改昵称冒充别人也能分辨；手打的「@机器人昵称」可选算作 @。
+- 每个群可以在插件设置里单独选择人格，群改名不影响绑定。
+
+**好友私聊**
+
+- 默认回复所有好友，不需要 @；可改为只回复白名单里的好友，或完全关闭私聊。
+- 只有桥接标记为私聊的会话才算数，微信团队、公众号等系统会话不会交给模型。
+
+**图片、语音与文件**
+
+- 接收图片、语音、动画表情、引用回复和普通文件；下载后校验长度和 SHA-256。
+- 语音交给 AstrBot 的语音转文字；群里的图片和文件在提问者随后 @ 机器人或引用它时附给模型。
+- 回复里的图片和文件会上传发送，单个文件上限 50 MiB。
+
+**主动消息与定时提醒**
+
+- 可开放主动发送：AstrBot 定时任务、其他插件和 `send_message_to_user` 工具都能发到白名单群或私聊。
+- 在群里 @ 机器人说「每天早上 8 点提醒我……」即可创建提醒，到点会 @ 创建者。
+
+**WebUI 管理面板**
+
+- 在 AstrBot WebUI 的「插件」页打开「微信管理面板」：查看在线状态与今日收发，设备确认登录或扫码登录，浏览会话、搜索通讯录、发测试消息，查看插件日志和桥接事件。
+- 桥接令牌只在服务器端使用，面板沿用 WebUI 的登录鉴权。
+
+**稳定性**
+
+- 小号掉线或桥接不可达时，向指定的 AstrBot 会话（如 QQ 私聊）发提醒，恢复后再通知。
+- 保存事件游标和已处理消息 ID，发送带幂等键；发送前复查原消息，已撤回的不再回复。
 
 ## 工作方式
 
 ```mermaid
 flowchart LR
-    A[指定微信群中的 @文字消息] --> B[agent-wechat 1.1.0]
-    B -->|本机 HTTP API| C[AstrBot 平台适配器]
-    C -->|群白名单与明确 @ 检查| D[AstrBot 独立群配置]
-    D --> E[已配置的聊天模型]
-    E --> D
-    D -->|文字回复| C
-    C --> B
-    B --> A
+    W[微信群 / 好友私聊] <--> B[agent-wechat 原生服务<br/>127.0.0.1:6174]
+    B <-->|本机 HTTP API| P[本插件<br/>准入、媒体、发送]
+    P <--> A[AstrBot<br/>独立群配置、人格、模型]
+    P --- UI[WebUI 管理面板]
 ```
 
-## 当前能力
+插件只连接 `http://127.0.0.1:6174`，认证令牌从本地文件读取。Docker 部署时让桥接容器共用 AstrBot 容器的网络，见 [Docker 部署](docs/DOCKER.md)。
 
-- 只接收配置中列出的微信群、明确 @当前微信号的文字消息，以及好友私聊（fork 0.7，可用好友白名单限制）。
-- 忽略其他群、系统和公众号会话、自己发送的消息、历史回放和仅 @全体成员的消息。
-- 为尚未绑定独立配置的目标群创建 AstrBot 配置，指定聊天模型，取消额外的模型唤醒前缀；不修改其他平台的默认设置。
-- 在插件设置中按群名显示允许回复的群，每个群可独立选择人格。
-- 保存人格选择后自动重载插件；默认在切换人格时新建对话，旧会话记录保留。
-- 自动读取群名，群改名不影响群 ID 绑定；桥接暂时不可用时保留上次名称。
-- 保存事件游标和已处理消息 ID；发送请求带幂等键，减少重复回复。
-- 发送前再次读取原消息，已撤回的消息不继续回复。
-- 桥接只连接 `http://127.0.0.1:6174`，认证令牌从本地文件读取。
+## 环境要求
 
-## 已验证环境
-
-| 组件 | 实测版本 / 范围 |
+| 组件 | 要求与实测情况 |
 | --- | --- |
-| 操作系统 | Ubuntu、Linux x86_64；测试主机 glibc 2.43 |
-| Python | 3.12 |
-| AstrBot | 4.29.3，启动器安装的源码运行实例 |
-| agent-wechat | npm `@agent-wechat/cli@1.1.0`，原生 `wx` 服务 |
-| aiohttp | 3.14.5 |
-| 模型 | 阿里云百炼 OpenAI 兼容接口中的 `qwen-flash` |
-| 验证日期 | 2026-10-28 |
+| AstrBot | 实测 4.29.3（源码运行）和 4.29.4（官方 Docker 镜像，ARM64）；管理面板需要 4.28 及以上的插件页面功能 |
+| agent-wechat | 文字收发在 1.1.0 和 1.5.1 上验证；图片、语音、文件功能需要 1.3 及以上，实测 1.5.1 |
+| Python | 3.11 及以上，实测 3.12 |
+| 聊天模型 | 任何能在 AstrBot 里正常工作的提供商；要让模型看图，需要支持图片输入的模型 |
+| 语音转文字 | 在对应的 AstrBot 配置里开启，实测硅基流动 `FunAudioLLM/SenseVoiceSmall`（OpenAI Whisper API 类型） |
 
-实测完成：测试号扫码登录 → 接收指定群 @消息 → AstrBot 调用模型 → 微信服务器接受发送 → 群成员确认收到回复。另有自动测试覆盖准入、去重、撤回检查、发送回执、群配置隔离及人格切换。
-
-以上仅代表这一环境的验证结果。插件依赖 AstrBot 的配置管理接口；其他版本、操作系统或账号状态需要重新验证。
+其他版本、操作系统或账号状态需要自行验证。
 
 ## 开始使用
 
-请按 [Ubuntu 部署步骤](docs/DEPLOYMENT.md) 操作。流程是：
+1. 部署 AstrBot，配置一个能正常回复的聊天模型，记下它的完整提供商 ID。
+2. 部署 agent-wechat 桥接，用**单独的微信小号**登录：
+   - Docker：[docs/DOCKER.md](docs/DOCKER.md)（推荐，已在生产环境长期运行）
+   - 源码运行：[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
+3. 把小号拉进目标群，查出账号 ID 和群 ID。
+4. 停止 AstrBot，安装插件并添加平台配置，再启动。
+5. 用另一个微信号在目标群里 @ 小号，或直接私聊它，确认收到回复。
 
-1. 准备 AstrBot，并在它的管理界面配置可正常调用的聊天模型。
-2. 独立安装 `agent-wechat` 1.1.0，用本仓库脚本生成私有运行配置。
-3. 启动本机桥接服务，用单独的微信测试号扫码确认。
-4. 把测试号加入目标群，查询账号 ID、群 ID。
-5. 停止 AstrBot，运行安装脚本，指定模型 ID 和群 ID，再启动 AstrBot。
-6. 用另一个账号在目标群中 @测试号进行验证。
+全部配置项见 [配置说明](docs/CONFIGURATION.md)，常见问题见 [故障排查](docs/TROUBLESHOOTING.md)，版本变化见 [更新日志](CHANGELOG.md)。
 
-也可根据 [平台配置示例](examples/platform.example.json) 手动安装。示例中的值全部是占位数据，不能直接运行。
+## 按群选择人格
 
-## 按群选择人格（0.2.0）
+1. 在 AstrBot 的「人格」页面创建人格并保存。
+2. 打开「插件 → AstrBot for Personal WeChat → 配置 → 微信群人格」，在对应群名的卡片里选择人格。
+3. 建议保留「切换人格时开始新对话」，然后保存。插件会自动重载，下一条消息生效。
 
-1. 先在 AstrBot 的 **人格** 页面创建或编辑人格并保存。
-2. 进入 **插件 → AstrBot for Personal WeChat → 配置**，展开 **微信群人格**。
-3. 找到对应群名的卡片，在 **此群使用的人格** 中选择人格。每个群可以不同。
-4. 建议保留 **切换人格时开始新对话**，然后保存。保存会自动重载插件，等待正在生成的群回复完成后应用。下一条消息使用新选择。
-5. 用另一个微信号在目标群中 @机器人，询问名字和爱好，验证结果。
+插件为每个群建立独立配置，所以**只改 AstrBot 的默认人格不会影响微信群**，请在这里切换。这里只能管理平台白名单里的群，添加卡片不会授权新群。
 
-首次从 0.1.0 升级，需要复制新增的 `_conf_schema.json` 并重启一次 AstrBot，之后刷新管理页面。日常保存插件设置不需要重启整个实例。
+## 安全提示
 
-**为什么只改默认人格没有效果？** 插件为每个群创建独立配置，群配置不会跟随默认配置自动修改；已有会话还可能指定了另一个人格。新版保存群选项时会同步该群配置及已有的会话覆盖。不要再通过修改全局默认配置来切换群人格。
+- AstrBot 的本地代码执行（`computer_use_local_permissions`）如果对普通成员开放，任何群成员 @ 机器人、任何好友私聊机器人，都可能让它执行命令、读取含 API 密钥和桥接令牌的配置文件。建议普通成员关闭执行，文件范围限制为 `workspace`。
+- 私聊默认对所有好友开放，能加小号为好友的人都能使用机器人。只想服务群时，设置 `friend_whitelist: true` 并留空 `allowed_friends`。
+- 个人号的非官方接入可能遇到风控、掉线或协议变更；主动消息发得越多，风险越高。请使用单独的小号，并让群成员知道机器人的用途。
 
-**新对话开关的含义：** 仅当实际选择的人格改变时新建对话。普通保存、重启、刷新群名不会反复新建；关闭开关则沿用原历史，只更新人格。旧会话不会删除。仅编辑同一个人格的提示词不会自动新建对话，如仍受旧风格影响，可在会话管理中手动新建。
+## 限制
 
-群名在插件启动或保存时从本机桥接读取，同时显示在 AstrBot 的群配置名称中（`微信 · 群名`）。读取失败会沿用缓存名，首次读取失败则显示群 ID；群名刷新不会改变人格选择。平台 ID 和群 ID 用来精确匹配，通常无需手动修改。
-
-这里只管理平台允许列表中的群；手动添加卡片不会授权新群，已移出允许列表的条目不会应用。删除卡片后会重新发现仍被允许的群，并保留其当前人格。重名群可根据群 ID 区分。不存在的人格不会覆盖当前有效配置，启动日志会给出提示。
+- 手机退出或切换走小号时，微信会把桥接踢下线，需要在管理面板重新登录。
+- 流式输出会合并后发送。
+- 重启前的消息、超过 5 分钟的消息不会回复；模型太慢时，发送前检查可能丢弃结果。
+- 游标在交给 AstrBot 之前落盘，优先避免重复回复；进程恰好在落盘后崩溃时可能漏掉一条消息。
+- 发送结果不确定时不会自动重发，需要查看桥接发送记录。
+- 源码运行方式没有设置开机自启，桥接和 AstrBot 都要保持运行。
 
 ## 目录
 
 ```text
-main.py                       AstrBot 插件入口与平台适配器
-panel.py                      WebUI 管理面板的后端路由
-views/panel/                  WebUI 管理面板页面（原生 HTML/CSS/JS）
+main.py                       插件入口与平台适配器
+panel.py                      管理面板后端路由
+views/panel/                  管理面板页面（原生 HTML/CSS/JS）
 .astrbot-plugin/i18n/         面板标题等界面文字
 metadata.yaml                 插件信息
 logo.png                      插件与平台图标
-_conf_schema.json             按群显示与人格选择界面
+_conf_schema.json             插件配置界面
 requirements.txt              运行依赖
 scripts/setup_bridge.py       生成本机桥接配置
 scripts/wx                    调用独立安装的桥接 CLI
 scripts/install_plugin.py     安装插件、备份并追加平台配置
-examples/platform.example.json
-tests/test_adapter.py         自动测试
-tests/test_panel.py           管理面板测试
-docs/DEPLOYMENT.md             部署、启动、停止、升级与移除
-docs/TROUBLESHOOTING.md        故障排查
-OPEN_SOURCE.md                构建来源、依赖与许可证说明
-LICENSE                       本仓库许可证
+examples/platform.example.json  平台配置示例（占位数据）
+tests/                        自动测试
+docs/                         部署、Docker、配置与故障排查
+CHANGELOG.md                  更新日志
+OPEN_SOURCE.md                依赖、参考项目与许可证说明
 ```
-
-## 限制与行为边界
-
-- 支持接收文字、引用回复、图片、语音、动画表情和普通文件，回复可包含文字、图片、文件和 @。
-- 流式输出会合并后发送。
-- 重启后忽略启动前的消息；超过 5 分钟的消息也不会回复。模型处理过慢时，发送前检查可能丢弃结果。
-- 游标在交给 AstrBot 之前落盘，优先避免重复回复。进程恰在落盘后崩溃时，可能漏掉该条消息；不承诺恰好一次投递。
-- 发送结果不确定时，不会自动重新提交。需要查看桥接发送记录判断实际状态。
-- 上游新建的独立账号资料可能标记 `schemaCompatibility: unverified` 或存在待投影批次。登录成功不等于所有接口都兼容；应以实际收发为准。
-- 默认没有开机自启。Ubuntu、桥接和 AstrBot 都需要保持运行。
-- 使用个人账号的非官方接入可能遇到微信风控、掉线或协议变更。建议使用单独测试号，并让群成员知晓机器人用途。
 
 ## 开发与测试
 
-测试需要已安装 AstrBot 及其依赖。不要把真实微信资料用于测试。
+测试需要已安装的 AstrBot 及其依赖，使用模拟消息和请求，不登录微信、不发真实消息、不调用收费模型。
 
 ```bash
-# 在本仓库目录中，用已有 AstrBot 虚拟环境运行。
-# ASTRBOT_CORE 指向包含 astrbot/ 的源码目录。
+# ASTRBOT_CORE 指向包含 astrbot/ 的源码目录
 export ASTRBOT_CORE=/absolute/path/to/AstrBot
 export ASTRBOT_PYTHON=/absolute/path/to/venv/bin/python
 PYTHONPATH="$ASTRBOT_CORE:$PWD" "$ASTRBOT_PYTHON" -m unittest discover -s tests -v
 
-# 在开发环境另行安装 Ruff 后执行：
 ruff check .
 ruff format --check .
 ```
 
-自动测试使用模拟消息与请求，不登录微信、不发群消息、不调用收费模型。
+也可以在一次性的 AstrBot 官方镜像中运行（AstrBot 会在当前目录创建 `data/`，所以工作目录用 `/tmp`）：
+
+```bash
+docker run --rm --network none --read-only --tmpfs /tmp -w /tmp \
+  -v "$PWD:/src:ro" -e PYTHONPATH=/src:/AstrBot -e PYTHONDONTWRITEBYTECODE=1 \
+  --entrypoint python soulter/astrbot:v4.29.4 -m unittest discover -s /src/tests -v
+```
+
+仓库使用 LF 换行，Windows 上请设置 `git config core.autocrlf false`。
 
 ## 来源与许可
 
-本仓库代码采用 **AGPL-3.0-or-later**，见 [LICENSE](LICENSE)。主要依赖与参考项目包括 [AstrBot](https://github.com/AstrBotDevs/AstrBot)、[agent-wechat](https://github.com/thisnick/agent-wechat)、[aiohttp](https://github.com/aio-libs/aiohttp)，以及前期评估过的 [astrbot-plugin-agent-wechat](https://github.com/JackZhaoooooo/astrbot-plugin-agent-wechat)。详细用途、版本及许可证核验范围见 [OPEN_SOURCE.md](OPEN_SOURCE.md)。
+本项目最初基于 [shuizhaodemumu/astrbot-for-personal-wechat](https://github.com/shuizhaodemumu/astrbot-for-personal-wechat) 的 0.2.0 版本（按群人格与基础的群 @ 回复），之后的 0.3 至 0.9 版本在本仓库独立开发，不再与原仓库同步。原作者的提交和 `v0.2.0` 标签保留在 Git 历史中，感谢原作者的工作。
 
-**本仓库的许可证不覆盖第三方桥接程序。** 部分公开可读的上游仓库未提供可确认的仓库级许可证，不能据此推定可以任意再分发。本仓库只提供安装指引和链接，不重新分发这些项目。
+代码采用 **AGPL-3.0-or-later**，见 [LICENSE](LICENSE)。依赖与参考项目（AstrBot、agent-wechat、aiohttp 等）的用途、版本和许可证核验范围见 [OPEN_SOURCE.md](OPEN_SOURCE.md)。
+
+**本仓库的许可证不覆盖第三方桥接程序。** agent-wechat 未提供可确认的仓库级许可证，本仓库只提供安装指引和链接，不重新分发它。

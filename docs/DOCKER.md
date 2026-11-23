@@ -1,6 +1,6 @@
 # Docker 部署（AstrBot 官方镜像 + agent-wechat 原生镜像）
 
-上游文档只覆盖源码运行的 AstrBot。插件写死了 `http://127.0.0.1:6174`，而 `wx serve` 也只接受回环地址监听，所以在 Docker 中让桥接容器**共用 AstrBot 容器的网络命名空间**即可，不需要改代码、也不对外开放端口。以下配置在 AstrBot v4.29.4（ARM64）上实测：文字收发先在 agent-wechat v1.1.0、后在 v1.5.1 验证；发送图片需要 v1.3 及以上（实测 v1.5.1，原地升级保留登录态，升级前请备份 `wechat/data`）。
+[源码部署文档](DEPLOYMENT.md) 只覆盖源码运行的 AstrBot。插件写死了 `http://127.0.0.1:6174`，而 `wx serve` 也只接受回环地址监听，所以在 Docker 中让桥接容器**共用 AstrBot 容器的网络命名空间**即可，不需要改代码、也不对外开放端口。以下配置在 AstrBot v4.29.4（ARM64）上实测：文字收发先在 agent-wechat v1.1.0、后在 v1.5.1 验证；发送图片需要 v1.3 及以上（实测 v1.5.1，原地升级保留登录态，升级前请备份 `wechat/data`）。
 
 ## 1. 目录与配置
 
@@ -65,7 +65,9 @@ $WX --account bot --json account status
 
 微信的电脑类登录依附手机：手机退出或切换走这个小号，服务器会把桥接踢下线（事件 `account.connection`，`serviceCode -13`）。重新登录先试 `auth login --strategy saved-device`（手机确认即可）；若返回 `needs_login`，说明已保存的设备凭证被作废，需要重新扫码。建议用安卓「应用分身」或备用机让小号常驻登录。
 
-## 4. 平台配置
+## 4. 安装插件与平台配置
+
+把本仓库的 `main.py`、`panel.py`、`metadata.yaml`、`logo.png`、`requirements.txt`、`_conf_schema.json` 以及 `views/`、`.astrbot-plugin/` 两个目录复制到 `data/plugins/astrbot_plugin_native_wechat/`。
 
 `data/cmd_config.json` 的 `platform` 中追加（容器内路径）：
 
